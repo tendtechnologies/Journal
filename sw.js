@@ -1,9 +1,9 @@
-/* Journal — Service Worker v7 */
-const CACHE = 'journal-v7';
+/* Journal — Service Worker v8 */
+const CACHE = 'journal-v8';
 const PRECACHE = [
   './index.html',
-  './css/app.css?v=7',
-  './js/app.js?v=7',
+  './css/app.css?v=8',
+  './js/app.js?v=8',
   './manifest.json',
   './assets/icon-192.png',
   './assets/icon-512.png',

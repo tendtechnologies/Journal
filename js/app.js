@@ -172,13 +172,26 @@ function isEmpty(e) {
 
 /* ─── Moods ───────────────────────────────────────────────────── */
 
+// A diverging scale: two hues either side of a neutral midpoint, shared with
+// the Android app so a day looks the same in both. The old ramp had Good and
+// Great only ΔE 2.5 apart — visually one colour — and put amber as a third hue
+// on one arm, which made it read as a traffic light rather than a scale.
+// Dark mode uses its own steps (see moodColor): on a dark surface the extremes
+// have to be the BRIGHTEST, so the arms run the other way.
 const MOODS = [
-  { v: 1, l: 'Rough', c: '#EF4444' },
-  { v: 2, l: 'Low',   c: '#F59E0B' },
-  { v: 3, l: 'Okay',  c: '#64748B' },
-  { v: 4, l: 'Good',  c: '#22B07D' },
-  { v: 5, l: 'Great', c: '#10B981' },
+  { v: 1, l: 'Rough', c: '#DC2626', d: '#F87171' },
+  { v: 2, l: 'Low',   c: '#F87171', d: '#DC2626' },
+  { v: 3, l: 'Okay',  c: '#475569', d: '#A8B0BD' },
+  { v: 4, l: 'Good',  c: '#22D3EE', d: '#0891B2' },
+  { v: 5, l: 'Great', c: '#0891B2', d: '#67E8F9' },
 ];
+
+// Every mood colour goes through here so the dark steps are never forgotten.
+function moodColor(v) {
+  const m = mood(v);
+  if (!m) return 'currentColor';
+  return document.body.classList.contains('dark') ? m.d : m.c;
+}
 const mood = v => MOODS.find(m => m.v === v);
 
 const FACE = {
@@ -191,7 +204,7 @@ const FACE = {
 
 function moodSvg(v, size, color) {
   const m = mood(v);
-  const c = color || (m ? m.c : 'currentColor');
+  const c = color || (m ? moodColor(m.v) : 'currentColor');
   return '<svg width="' + size + '" height="' + size + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
     + 'stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex-shrink:0;color:' + c + '">'
     + '<circle cx="12" cy="12" r="9"/>' + (FACE[v] || '') + '</svg>';
@@ -746,7 +759,7 @@ function openDatePicker() {
 function renderMoods() {
   const e = state.draft;
   $('mood-strip').innerHTML = MOODS.map(m => `
-    <button class="mood-btn${e.mood === m.v ? ' on' : ''}" data-m="${m.v}" style="${e.mood === m.v ? 'color:' + m.c : ''}">
+    <button class="mood-btn${e.mood === m.v ? ' on' : ''}" data-m="${m.v}" style="${e.mood === m.v ? 'color:' + moodColor(m.v) : ''}">
       ${moodSvg(m.v, 23)}<span>${m.l}</span>
     </button>`).join('');
   document.querySelectorAll('#mood-strip .mood-btn').forEach(b => {
@@ -1053,7 +1066,7 @@ function renderCalendar() {
           const e = DB.entries[k];
           const isToday = k === todayKey();
           const future = daysBetween(todayKey(), k) < 0;
-          const mc = e && e.mood ? mood(e.mood).c : null;
+          const mc = e && e.mood ? moodColor(e.mood) : null;
           return `<button class="cal-cell${e ? ' has' : ''}${isToday ? ' today' : ''}${future ? ' future' : ''}"
             data-open="${k}" ${future ? 'disabled' : ''}
             ${mc ? `style="background:${mc}24;border-color:${mc}66;color:var(--text-1)"` : ''}>
@@ -1152,7 +1165,7 @@ function renderInsights() {
       <div class="card-title">How often each mood</div>
       ${dist.map(d => `<div class="bar-row">
         <span class="bar-lbl" style="display:flex;align-items:center;gap:7px">${moodSvg(d.v, 15)}${d.l}</span>
-        <div class="bar-track"><div class="bar-fill" style="width:${(d.n / distMax) * 100}%;background:${d.c}"></div></div>
+        <div class="bar-track"><div class="bar-fill" style="width:${(d.n / distMax) * 100}%;background:${moodColor(d.v)}"></div></div>
         <span class="bar-num">${d.n}</span></div>`).join('')}
     </div>
 
@@ -1286,7 +1299,7 @@ function buildHeatmap() {
         ${mo.cells.map(d => {
           if (d > today) return '<div class="heat-cell" style="background:transparent"></div>';
           const k = dkey(d), e = DB.entries[k];
-          const bg = e ? (e.mood ? mood(e.mood).c : '#6366F1') : 'var(--surface-3)';
+          const bg = e ? (e.mood ? moodColor(e.mood) : '#6366F1') : 'var(--surface-3)';
           return `<div class="heat-cell" style="background:${bg}" title="${esc(fmt.short(k))}${e ? ' · wrote' : ''}"></div>`;
         }).join('')}
       </div>
@@ -1447,6 +1460,10 @@ function toggleTheme() {
   const dark = !document.body.classList.contains('dark');
   localStorage.setItem(LS.theme, dark ? 'dark' : 'light');
   applyTheme(dark);
+  // Mood colours differ per theme and are baked into already-rendered markup
+  // (inline styles, the canvas, the heatmap), so the view has to be redrawn —
+  // a CSS variable swap can't reach them.
+  if (typeof ready !== 'undefined' && ready) render();
 }
 function initTheme() {
   const saved = localStorage.getItem(LS.theme);
