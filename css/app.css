@@ -20,6 +20,9 @@
   --surface-3:   #E9EAF0;
   --border:      #E4E5EC;
   --border-soft: #EFF0F5;
+  --key-surface: #E7E7F0;
+  --key-hover:   #DADAE6;
+  --key-border:  #C9CADA;
 
   --text-1: #14151A;
   --text-2: #62636E;
@@ -43,6 +46,9 @@ body.dark {
   --surface-3:   #292A33;
   --border:      #2B2C36;
   --border-soft: #23242C;
+  --key-surface: #262832;
+  --key-hover:   #30323D;
+  --key-border:  #3C3E4A;
   --text-1: #F2F3F7;
   --text-2: #A0A1AE;
   --text-3: #6C6D7A;
@@ -156,13 +162,14 @@ button { background: none; border: none; cursor: pointer; }
 .pin-pad { display: grid; grid-template-columns: repeat(3, 64px); gap: 12px; margin-top: 24px; }
 .pin-pad button {
   width: 64px; height: 64px; border-radius: 50%;
-  background: var(--surface-2); border: 1px solid var(--border-soft);
+  background: var(--key-surface); border: 1px solid var(--key-border);
   font-size: 1.3rem; font-weight: 600; color: var(--text-1);
   display: flex; align-items: center; justify-content: center;
   transition: background var(--t), transform var(--t);
+  box-shadow: var(--sh-sm);
 }
 .pin-pad button .ic { width: 20px; height: 20px; }
-.pin-pad button:hover { background: var(--surface-3); }
+.pin-pad button:hover { background: var(--key-hover); }
 .pin-pad button:active { transform: scale(.94); }
 .pin-pad #pin-back { background: none; border: none; color: var(--text-2); }
 .pin-pad #pin-back:hover { background: var(--surface-2); }
