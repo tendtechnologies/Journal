@@ -51,17 +51,35 @@ async function pullAll() {
   setSync('syncing');
   try {
     const snap = await col().get();
-    if (!snap.empty) {
-      snap.forEach(d => {
-        const clean = normalize(d.id, d.data());
-        if (!clean) return;
-        const local = DB.entries[clean.date];
-        if (!local || (clean.updatedAt || 0) >= (local.updatedAt || 0)) DB.entries[clean.date] = clean;
-      });
-      saveLocal();
-    } else {
-      for (const k of Object.keys(DB.entries)) await pushDay(DB.entries[k]);
+    const remote = {};
+    snap.forEach(d => {
+      const clean = normalize(d.id, d.data());
+      if (clean) remote[clean.date] = clean;
+    });
+
+    // Merge remote into local — newer updatedAt wins.
+    for (const key of Object.keys(remote)) {
+      const clean = remote[key];
+      const local = DB.entries[key];
+      if (!local || (clean.updatedAt || 0) >= (local.updatedAt || 0)) DB.entries[key] = clean;
     }
+    saveLocal();
+
+    // Push back anything local that's newer than, or missing from, the
+    // remote copy. Without this, an offline edit — or any push that failed
+    // and left syncState as 'offline' — sits on this device forever and
+    // Firestore (and every other device) never learns about it; the old
+    // logic only ever pushed on a completely empty first sync.
+    const pushes = [];
+    for (const key of Object.keys(DB.entries)) {
+      const local = DB.entries[key];
+      const remoteEntry = remote[key];
+      if (!remoteEntry || (local.updatedAt || 0) > (remoteEntry.updatedAt || 0)) {
+        pushes.push(pushDay(local));
+      }
+    }
+    await Promise.all(pushes);
+
     setSync('synced');
   } catch (err) { console.warn('sync failed', err); setSync('offline'); }
 }
@@ -271,7 +289,14 @@ function loadLocal() {
   ['jr_entries', 'jr2_entries', 'jr2_journals', 'jr2_migrated', 'jr2_prefs', 'jr2_theme']
     .forEach(k => localStorage.removeItem(k));
 }
-function saveLocal() { localStorage.setItem(LS.entries, JSON.stringify(DB.entries)); }
+function saveLocal() {
+  try {
+    localStorage.setItem(LS.entries, JSON.stringify(DB.entries));
+  } catch (err) {
+    console.warn('local save failed', err);
+    toast('Could not save on this device — storage may be full. Try removing a photo.');
+  }
+}
 function savePrefs() { localStorage.setItem(LS.prefs, JSON.stringify(DB.prefs)); }
 
 /* ─── PIN lock ────────────────────────────────────────────────────
@@ -850,8 +875,26 @@ function wireWriter() {
   body.addEventListener('keyup', syncFormatBar);
   body.addEventListener('mouseup', syncFormatBar);
   body.addEventListener('paste', ev => {
+    const cd = ev.clipboardData || window.clipboardData;
+    let files = cd && cd.files ? Array.from(cd.files) : [];
+    if (!files.length && cd && cd.items) {
+      files = Array.from(cd.items)
+        .filter(it => it.kind === 'file')
+        .map(it => it.getAsFile())
+        .filter(Boolean);
+    }
+    files = files.filter(f => f && f.type && f.type.startsWith('image/'));
+    if (files.length) {
+      // A pasted screenshot used to vanish silently — text/plain was the
+      // only thing this handler ever read. Route it through the same photo
+      // pipeline as the photo button rather than trying to inline it into
+      // the contenteditable body, which the rest of the app doesn't expect.
+      ev.preventDefault();
+      addPhotos(files);
+      return;
+    }
     ev.preventDefault();
-    const text = (ev.clipboardData || window.clipboardData).getData('text/plain');
+    const text = cd.getData('text/plain');
     document.execCommand('insertText', false, text);
   });
 
@@ -1462,7 +1505,10 @@ function toggleTheme() {
   applyTheme(dark);
   // Mood colours differ per theme and are baked into already-rendered markup
   // (inline styles, the canvas, the heatmap), so the view has to be redrawn —
-  // a CSS variable swap can't reach them.
+  // a CSS variable swap can't reach them. Commit first: renderWrite() rebuilds
+  // state.draft straight from DB.entries, which would otherwise discard
+  // anything typed since the last autosave tick.
+  if (state.view === 'write') commitDraft();
   if (typeof ready !== 'undefined' && ready) render();
 }
 function initTheme() {

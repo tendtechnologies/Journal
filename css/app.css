@@ -26,7 +26,7 @@
 
   --text-1: #14151A;
   --text-2: #62636E;
-  --text-3: #9B9CA8;
+  --text-3: #6B6C78;  /* was #9B9CA8 — ~2.6:1 on white, fails AA; this clears 5:1 */
 
   --r-xs: 6px; --r-sm: 9px; --r-md: 13px; --r-lg: 18px; --r-xl: 24px;
 
@@ -51,7 +51,7 @@ body.dark {
   --key-border:  #3C3E4A;
   --text-1: #F2F3F7;
   --text-2: #A0A1AE;
-  --text-3: #6C6D7A;
+  --text-3: #9C9CAD;  /* was #6C6D7A — ~3.4:1 on the dark card, fails AA; this clears 6.5:1 */
   --accent-soft: #1E1F3D;
   --red-soft:   #2C1114;
   --amber-soft: #2B1E06;
