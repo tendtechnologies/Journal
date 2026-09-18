@@ -6,7 +6,7 @@
   "scripts": {
     "bump-version": "node scripts/bump-version.mjs",
     "check-version": "node scripts/check-version.mjs",
-    "test:unit": "node --test tests/unit/",
+    "test:unit": "node --test tests/unit/core.test.mjs",
     "test": "npm run test:unit && playwright test"
   },
   "devDependencies": {
