@@ -27,8 +27,11 @@ class CloudSync {
     suspend fun pullAll(uid: String): Result<List<Entry>> = runCatching {
         val snapshot = days(uid).get().await()
         // A document that can't be parsed is skipped, not defaulted: a bad date
-        // silently becoming "today" would overwrite a real entry.
+        // silently becoming "today" would overwrite a real entry. Trashed days
+        // (deleted=true tombstones from the web app's trash) are dropped too —
+        // they sync so deletions propagate, but never surface in any view.
         snapshot.documents.mapNotNull { Entry.fromMap(it.id, it.data) }
+            .filter { !it.deleted }
     }.mapError()
 
     suspend fun push(uid: String, entry: Entry): Result<Unit> = runCatching {
@@ -36,6 +39,12 @@ class CloudSync {
         Unit
     }.mapError()
 
+    /**
+     * HARD delete — permanent removal. Only the trash purge may call this;
+     * every user-facing delete is a tombstone (deleted=true), so it can be
+     * undone and so other devices learn about it instead of resurrecting
+     * the entry on their next sync.
+     */
     suspend fun delete(uid: String, date: LocalDate): Result<Unit> = runCatching {
         days(uid).document(Entry.key(date)).delete().await()
         Unit

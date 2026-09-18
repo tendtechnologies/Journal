@@ -102,6 +102,16 @@ data class AppPalette(
     val padGrid: Color,
     /** How strongly the pad's colour field shows. Dark needs more to register. */
     val padFieldAlpha: Float,
+    /**
+     * The PIN keypad's digit circles. Deliberately its own token rather than
+     * [padSurface]: padSurface sits only ~2% lighter/darker than
+     * [screenBackground], which reads fine as a recessed panel behind a
+     * colour field but leaves an unfilled circle almost invisible against the
+     * lock screen. keySurface/keyBorder are pulled further from the
+     * background so the keys read as buttons.
+     */
+    val keySurface: Color,
+    val keyBorder: Color,
     val moodRamp: List<Color>,
 )
 
@@ -117,6 +127,8 @@ val LightAppPalette = AppPalette(
     padSurface = Color(0xFFF4F4F9),
     padGrid = Color(0xFFE2E2EC),
     padFieldAlpha = 0.14f,
+    keySurface = Color(0xFFE7E7F0),
+    keyBorder = Color(0xFFC9CADA),
     moodRamp = LightMoodRamp,
 )
 
@@ -132,5 +144,7 @@ val DarkAppPalette = AppPalette(
     padSurface = Night900,
     padGrid = Color(0xFF33343F),
     padFieldAlpha = 0.22f,
+    keySurface = Color(0xFF262832),
+    keyBorder = Color(0xFF3C3E4A),
     moodRamp = DarkMoodRamp,
 )

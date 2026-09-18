@@ -47,6 +47,8 @@ data class UiState(
     val message: String? = null,
     val locatingPlace: Boolean = false,
     val theme: ThemeChoice = ThemeChoice.SYSTEM,
+    /** Most recently trashed entry — the UI shows an undo snackbar for it. */
+    val lastDeleted: Entry? = null,
 ) {
     val entryDates: Set<LocalDate> get() = entries.keys
     val today: LocalDate get() = LocalDate.now()
@@ -240,7 +242,13 @@ class JournalViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
-     * Writes the draft, or deletes the day if editing emptied it.
+     * Writes the draft — or sends the day to the trash if editing emptied it.
+     *
+     * Emptying an existing entry is almost always an accident (a stray
+     * select-all + delete), so it becomes a soft-delete tombstone: undoable
+     * from the snackbar, restorable for 30 days on the web, and never a hard
+     * delete — a hard-deleted document would resurrect on the web app's next
+     * sync, which pushes back anything local that's missing remotely.
      *
      * The HTML body is only regenerated when the text actually changed. An entry
      * written in the browser can carry formatting this screen doesn't render, and
@@ -255,12 +263,8 @@ class JournalViewModel(application: Application) : AndroidViewModel(application)
         val stored = current.entries[draft.date]
 
         if (draft.isEmpty) {
-            if (stored != null) {
-                _state.update { it.copy(entries = it.entries - draft.date, saving = false) }
-                viewModelScope.launch { cloud.delete(uid, draft.date) }
-            } else {
-                _state.update { it.copy(saving = false) }
-            }
+            _state.update { it.copy(saving = false) }
+            if (stored != null) trashEntry(stored)
             return
         }
 
@@ -282,16 +286,49 @@ class JournalViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun deleteEntry(date: LocalDate) {
+    /** Tombstones the entry: hides it everywhere and pushes the tombstone. */
+    private fun trashEntry(entry: Entry) {
         val uid = _state.value.user?.uid ?: return
+        val trashed = entry.copy(
+            deleted = true,
+            deletedAt = System.currentTimeMillis(),
+            updatedAt = System.currentTimeMillis(),
+        )
         _state.update {
             it.copy(
-                entries = it.entries - date,
-                draft = if (it.selectedDate == date) Entry(date = date) else it.draft,
+                entries = it.entries - entry.date,
+                draft = if (it.selectedDate == entry.date) Entry(date = entry.date) else it.draft,
+                lastDeleted = trashed,
             )
         }
-        viewModelScope.launch { cloud.delete(uid, date) }
+        viewModelScope.launch { cloud.push(uid, trashed) }
     }
+
+    fun deleteEntry(date: LocalDate) {
+        val entry = _state.value.entries[date] ?: return
+        trashEntry(entry)
+    }
+
+    /** Undo for the trash snackbar: restore the last trashed entry. */
+    fun undoDelete() {
+        val trashed = _state.value.lastDeleted ?: return
+        val uid = _state.value.user?.uid ?: return
+        val restored = trashed.copy(
+            deleted = false,
+            deletedAt = null,
+            updatedAt = System.currentTimeMillis(),
+        )
+        _state.update {
+            it.copy(
+                entries = it.entries + (restored.date to restored),
+                draft = if (it.selectedDate == restored.date) restored else it.draft,
+                lastDeleted = null,
+            )
+        }
+        viewModelScope.launch { cloud.push(uid, restored) }
+    }
+
+    fun dismissDeletedMessage() = _state.update { it.copy(lastDeleted = null) }
 
     // ── Place ─────────────────────────────────────────────────────────────
 

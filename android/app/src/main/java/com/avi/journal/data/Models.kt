@@ -37,6 +37,16 @@ data class Entry(
     val favorite: Boolean = false,
     val words: Int = 0,
     val updatedAt: Long = 0L,
+    /**
+     * Soft-delete tombstone, shared with the web app's trash: `deleted`
+     * marks the day as trashed (undoable from the app, restorable for 30
+     * days, purged for real only after that), and `deletedAt` is when it
+     * was trashed. Entries the web app trashed MUST NOT show up here — and
+     * a rewrite of the document must carry these fields along, or the
+     * phone would silently un-delete the day everywhere.
+     */
+    val deleted: Boolean = false,
+    val deletedAt: Long? = null,
 ) {
     val isEmpty: Boolean
         get() = title.isBlank() && plain.isBlank() && photos.isEmpty() &&
@@ -59,6 +69,8 @@ data class Entry(
         put(FIELD_FAVORITE, favorite)
         put(FIELD_WORDS, words)
         put(FIELD_UPDATED_AT, updatedAt)
+        put(FIELD_DELETED, deleted)
+        if (deletedAt != null) put(FIELD_DELETED_AT, deletedAt)
     }
 
     companion object {
@@ -77,6 +89,8 @@ data class Entry(
         const val FIELD_FAVORITE = "favorite"
         const val FIELD_WORDS = "words"
         const val FIELD_UPDATED_AT = "updatedAt"
+        const val FIELD_DELETED = "deleted"
+        const val FIELD_DELETED_AT = "deletedAt"
 
         fun key(date: LocalDate): String = date.format(KEY_FORMAT)
 
@@ -118,6 +132,8 @@ data class Entry(
                 favorite = data[FIELD_FAVORITE] as? Boolean ?: false,
                 words = (data[FIELD_WORDS] as? Number)?.toInt() ?: countWords(plain),
                 updatedAt = (data[FIELD_UPDATED_AT] as? Number)?.toLong() ?: 0L,
+                deleted = data[FIELD_DELETED] as? Boolean ?: false,
+                deletedAt = (data[FIELD_DELETED_AT] as? Number)?.toLong(),
             )
         }
 

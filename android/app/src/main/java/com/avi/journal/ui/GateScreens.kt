@@ -188,7 +188,12 @@ fun LockScreen(
                         modifier = Modifier
                             .size(68.dp)
                             .clip(CircleShape)
-                            .background(if (key.isBlank()) Color.Transparent else palette.padSurface)
+                            .background(if (key.isBlank()) Color.Transparent else palette.keySurface)
+                            .border(
+                                width = if (key.isBlank()) 0.dp else 1.dp,
+                                color = if (key.isBlank()) Color.Transparent else palette.keyBorder,
+                                shape = CircleShape,
+                            )
                             .clickable(enabled = key.isNotBlank()) {
                                 if (key == "⌫") {
                                     buffer = buffer.dropLast(1)

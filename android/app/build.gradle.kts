@@ -26,13 +26,21 @@ android {
         applicationId = "com.avi.journal"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // The release build ships minified and shrunk — an unminified
+            // APK nearly doubles download size for no benefit on a device
+            // nobody debugs. Bump versionCode above for every release.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
         }
     }
 
@@ -78,6 +86,16 @@ dependencies {
     implementation(platform("com.google.firebase:firebase-bom:34.18.0"))
     implementation("com.google.firebase:firebase-auth")
     implementation("com.google.firebase:firebase-firestore")
+
+    // Photos on entries: Firebase Storage download URLs need a network
+    // image loader (Coil); legacy base64 data URLs are decoded by hand in
+    // WriteScreen and need nothing.
+    implementation("io.coil-kt.coil3:coil-compose:3.0.4")
+    implementation("io.coil-kt.coil3:coil-network-okhttp:3.0.4")
+
+    // Unit tests for the pure logic — Entry round-trips, Insights — which
+    // is exactly where cross-client drift bugs live.
+    testImplementation("junit:junit:4.13.2")
 
     implementation("androidx.credentials:credentials:1.6.0")
     implementation("androidx.credentials:credentials-play-services-auth:1.6.0")

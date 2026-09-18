@@ -173,6 +173,29 @@ fun PinIcon(
     drawCircle(tint, radius = w * 0.10f, center = Offset(w * 0.50f, h * 0.38f))
 }
 
+/** Bin: lid, handle, and two vertical ribs on the body. */
+@Composable
+fun TrashIcon(
+    tint: Color,
+    contentDescription: String = "",
+    modifier: Modifier = Modifier,
+    size: Dp = 20.dp,
+) = IconCanvas(size, contentDescription, modifier) { w, h, stroke ->
+    strokePath(tint, stroke) {
+        moveTo(w * 0.20f, h * 0.28f); lineTo(w * 0.80f, h * 0.28f)
+    }
+    strokePath(tint, stroke) {
+        moveTo(w * 0.42f, h * 0.28f)
+        lineTo(w * 0.42f, h * 0.20f); lineTo(w * 0.58f, h * 0.20f); lineTo(w * 0.58f, h * 0.28f)
+    }
+    strokePath(tint, stroke) {
+        moveTo(w * 0.30f, h * 0.28f); lineTo(w * 0.34f, h * 0.82f)
+        lineTo(w * 0.66f, h * 0.82f); lineTo(w * 0.70f, h * 0.28f)
+    }
+    strokePath(tint, stroke) { moveTo(w * 0.44f, h * 0.42f); lineTo(w * 0.44f, h * 0.68f) }
+    strokePath(tint, stroke) { moveTo(w * 0.56f, h * 0.42f); lineTo(w * 0.56f, h * 0.68f) }
+}
+
 /** Steps: two footfalls, simplified to strides so they read at 16dp. */
 @Composable
 fun StepsIcon(

@@ -13,10 +13,16 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -51,6 +57,20 @@ fun AppScaffold(
 ) {
     val palette = AppTheme.palette
     var tab by rememberSaveable { mutableStateOf(AppTab.TODAY) }
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    // Undo for the trash: any soft-delete (delete button, or emptying a day)
+    // offers one-tap restore here, matching the web app's undo toast.
+    LaunchedEffect(state.lastDeleted) {
+        if (state.lastDeleted == null) return@LaunchedEffect
+        val result = snackbarHostState.showSnackbar(
+            message = "Entry moved to trash",
+            actionLabel = "Undo",
+            duration = SnackbarDuration.Short,
+        )
+        if (result == SnackbarResult.ActionPerformed) viewModel.undoDelete()
+        else viewModel.dismissDeletedMessage()
+    }
 
     Column(modifier = modifier.fillMaxSize().background(palette.screenBackground)) {
         Box(modifier = Modifier.weight(1f)) {
@@ -82,6 +102,11 @@ fun AppScaffold(
                     onSignIn = onSignIn,
                 )
             }
+
+            SnackbarHost(
+                hostState = snackbarHostState,
+                modifier = Modifier.align(Alignment.BottomCenter),
+            )
         }
 
         BottomBar(current = tab, onSelect = { tab = it })

@@ -1,16 +1,23 @@
 package com.avi.journal.ui
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.util.Base64
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
@@ -29,9 +36,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
+import coil3.compose.AsyncImage
 import com.avi.journal.JournalViewModel
 import com.avi.journal.UiState
 import com.avi.journal.data.Entry
@@ -42,6 +52,7 @@ import com.avi.journal.ui.components.MoodPicker
 import com.avi.journal.ui.components.PinIcon
 import com.avi.journal.ui.components.SectionCard
 import com.avi.journal.ui.components.StarIcon
+import com.avi.journal.ui.components.TrashIcon
 import com.avi.journal.ui.theme.AppTheme
 import com.avi.journal.ui.theme.ReadingBody
 import java.time.LocalDate
@@ -158,6 +169,22 @@ fun WriteScreen(
                         contentDescription = if (draft.favorite) "Remove favourite" else "Mark favourite",
                     )
                 }
+                // Delete only appears once the day exists remotely. It's a
+                // soft delete (trash + undo snackbar), never a hard one.
+                if (state.entries.containsKey(draft.date)) {
+                    Spacer(Modifier.width(6.dp))
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .clickable { viewModel.deleteEntry(draft.date) }
+                            .padding(6.dp),
+                    ) {
+                        TrashIcon(
+                            tint = palette.subtleText,
+                            contentDescription = "Delete entry",
+                        )
+                    }
+                }
             }
         }
 
@@ -180,6 +207,25 @@ fun WriteScreen(
             onAdd = viewModel::addTag,
             onRemove = viewModel::removeTag,
         )
+
+        // Photos attached on the web. Viewing only for now — adding photos
+        // here arrives with the full photo feature; until then the web app
+        // is the photographer and this screen is the light table. Both
+        // storage shapes render: legacy base64 data URLs and Firebase
+        // Storage download URLs.
+        if (draft.photos.isNotEmpty()) {
+            Spacer(Modifier.height(12.dp))
+            SectionCard(title = "Photos") {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    draft.photos.forEach { url -> EntryPhoto(url = url) }
+                }
+            }
+        }
 
         // Health context sits last and unlabelled-as-a-feature: it is background
         // for the day, not something to act on.
@@ -259,6 +305,47 @@ private fun DayHeader(
             )
         }
     }
+}
+
+@Composable
+private fun EntryPhoto(url: String) {
+    val palette = AppTheme.palette
+    Box(
+        modifier = Modifier
+            .size(96.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(palette.padSurface),
+        contentAlignment = Alignment.Center,
+    ) {
+        when {
+            url.startsWith("data:") -> {
+                val bitmap = remember(url) { decodeDataUrlBitmap(url) }
+                if (bitmap != null) {
+                    Image(
+                        bitmap = bitmap.asImageBitmap(),
+                        contentDescription = null,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop,
+                    )
+                }
+            }
+            else -> AsyncImage(
+                model = url,
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop,
+            )
+        }
+    }
+}
+
+private fun decodeDataUrlBitmap(url: String): Bitmap? {
+    val comma = url.indexOf(',')
+    if (comma < 0 || !url.substring(0, comma).contains(";base64")) return null
+    return runCatching {
+        val bytes = Base64.decode(url.substring(comma + 1), Base64.DEFAULT)
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+    }.getOrNull()
 }
 
 @Composable
