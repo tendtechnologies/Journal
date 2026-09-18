@@ -4,6 +4,15 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>Journal</title>
+  <meta name="description" content="Journal is a quiet, private place to write one entry a day — mood, photos, and a streak to keep you coming back, synced across your devices." />
+
+  <meta property="og:title" content="Journal" />
+  <meta property="og:description" content="A quiet place to write. One entry a day, synced across your devices." />
+  <meta property="og:type" content="website" />
+  <meta property="og:image" content="assets/icon-512.png" />
+  <meta name="twitter:card" content="summary" />
+
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://www.gstatic.com https://apis.google.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob: https://*.googleusercontent.com https://*.firebasestorage.app https://firebasestorage.googleapis.com; connect-src 'self' https://*.googleapis.com https://securetoken.googleapis.com https://identitytoolkit.googleapis.com https://firebasestorage.googleapis.com wss://*.firebaseio.com; frame-src https://accounts.google.com https://*.firebaseapp.com; object-src 'none'; base-uri 'self'; frame-ancestors 'self';" />
 
   <link rel="icon" type="image/png" sizes="192x192" href="assets/icon-192.png" />
   <link rel="shortcut icon" href="assets/icon-192.png" />
@@ -11,14 +20,16 @@
   <link rel="manifest" href="manifest.json" />
   <meta name="theme-color" content="#6366F1" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="Journal" />
+  <link rel="apple-touch-icon" sizes="180x180" href="assets/icon-180.png" />
   <link rel="apple-touch-icon" href="assets/icon-192.png" />
 
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Lora:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="css/app.css?v=10" />
+  <link rel="stylesheet" href="css/app.css?v=12" />
 </head>
 <body>
 
@@ -43,6 +54,7 @@
       <h1 class="gate-title" id="pin-title">Enter PIN</h1>
       <p class="gate-sub" id="pin-sub">Unlock your journal</p>
       <div class="pin-dots" id="pin-dots"></div>
+      <span class="sr-only" id="pin-progress" aria-live="polite" role="status"></span>
       <div class="pin-pad" id="pin-pad">
         <button type="button" data-k="1">1</button>
         <button type="button" data-k="2">2</button>
@@ -119,7 +131,7 @@
 
   <!-- Modal -->
   <div class="modal-backdrop" id="modal-backdrop">
-    <div class="modal" id="modal">
+    <div class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" tabindex="-1">
       <div class="modal-head">
         <h2 id="modal-title">Title</h2>
         <button class="icon-btn" id="modal-close" aria-label="Close">
@@ -130,7 +142,7 @@
     </div>
   </div>
 
-  <div class="toast" id="toast"></div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
   <!-- Recovery banner: shown only if the app fails to start -->
   <div id="recover">
@@ -145,70 +157,10 @@
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
-  <script src="js/app.js?v=10"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-storage-compat.js"></script>
+  <script src="js/core.js?v=12"></script>
+  <script src="js/app.js?v=12"></script>
 
-  <script>
-    // ── Self-healing: wipe caches + service worker, then reload ──
-    function hardReset() {
-      var jobs = [];
-      if ('caches' in window) {
-        jobs.push(caches.keys().then(function (ks) {
-          return Promise.all(ks.map(function (k) { return caches.delete(k); }));
-        }));
-      }
-      if ('serviceWorker' in navigator) {
-        jobs.push(navigator.serviceWorker.getRegistrations().then(function (rs) {
-          return Promise.all(rs.map(function (r) { return r.unregister(); }));
-        }));
-      }
-      return Promise.all(jobs)['catch'](function () {}).then(function () {
-        window.location.replace(window.location.pathname + '?fresh=' + Date.now());
-      });
-    }
-    document.getElementById('recover-btn').onclick = hardReset;
-
-    function showRecover(msg) {
-      var el = document.getElementById('recover');
-      if (!el) return;
-      el.classList.add('show');
-      var d = document.getElementById('recover-detail');
-      if (d && msg) d.textContent = msg;
-      var b = document.getElementById('boot');
-      if (b) b.classList.add('hide');
-    }
-
-    // If a script error escapes before the app is running, offer the fix.
-    window.addEventListener('error', function (ev) {
-      if (!window.__journalReady) {
-        showRecover(ev && ev.message ? String(ev.message) : '');
-      }
-    });
-
-    // Safety net: if nothing has rendered after 12s, surface the recovery card.
-    setTimeout(function () {
-      var c = document.getElementById('content');
-      var gateOpen = document.getElementById('auth-gate').classList.contains('show');
-      if (!window.__journalReady && !gateOpen && (!c || !c.innerHTML.trim())) {
-        showRecover('The app did not finish loading.');
-      }
-    }, 12000);
-
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('load', function () {
-        navigator.serviceWorker.register('./sw.js').then(function (reg) {
-          reg.update();
-          document.addEventListener('visibilitychange', function () {
-            if (document.visibilityState === 'visible') reg.update();
-          });
-        }).catch(function (e) { console.warn('SW reg failed:', e); });
-        var refreshing = false;
-        navigator.serviceWorker.addEventListener('controllerchange', function () {
-          if (refreshing) return;
-          refreshing = true;
-          window.location.reload();
-        });
-      });
-    }
-  </script>
+  <script src="js/boot.js?v=12"></script>
 </body>
 </html>

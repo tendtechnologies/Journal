@@ -2,6 +2,10 @@
    Journal — app.js
    One entry per day. Local-first, with Google sign-in and
    Firestore sync. Entries are keyed by date (YYYY-MM-DD).
+
+   Pure logic (dates, formatting, normalize, merge rules, tombstones,
+   streaks, moods, prompts) lives in js/core.js, which loads first and
+   is unit-tested under node --test.
 ================================================================ */
 
 'use strict';
@@ -42,10 +46,56 @@ async function pushDay(e) {
   try { await col().doc(e.date).set(e); setSync('synced'); }
   catch (err) { console.warn('save failed', err); setSync('offline'); }
 }
+// Hard delete — ONLY purgeTrash() may call this. Every user-facing delete
+// is a tombstone so it can be undone and so other devices learn about it
+// instead of resurrecting the entry (see pullAll's pushback).
 async function deleteDay(key) {
   if (!fbUser) return;
   try { await col().doc(key).delete(); } catch (err) { console.warn('delete failed', err); }
 }
+
+/* ─── Soft delete / trash ─────────────────────────────────────────
+   "Delete" marks an entry rather than removing it, so an accidental
+   delete — the worst kind of journaling accident — can be undone: right
+   away from the toast, or later from Settings → Recently deleted. Only
+   purgeTrash() (run once per boot) does the real, permanent removal, and
+   only once TRASH_DAYS has passed. The pure transforms live in core.js. ── */
+
+function softDeleteEntry(key) {
+  const e = DB.entries[key];
+  if (!e || e.deleted) return;
+  DB.entries[key] = applyTombstone(e, Date.now());
+  saveLocal();
+  pushDay(DB.entries[key]);
+}
+
+function restoreEntry(key) {
+  const e = DB.entries[key];
+  if (!e || !e.deleted) return;
+  DB.entries[key] = restoreFromTombstone(e, Date.now());
+  saveLocal();
+  pushDay(DB.entries[key]);
+}
+
+function trashedEntries() {
+  return Object.values(DB.entries)
+    .filter(e => isKey(e.date) && e.deleted)
+    .sort((a, b) => (b.deletedAt || 0) - (a.deletedAt || 0));
+}
+
+async function purgeTrash() {
+  const now = Date.now();
+  const gone = Object.keys(DB.entries).filter(k => isPurged(DB.entries[k], now));
+  if (!gone.length) return;
+  // Remove from Firestore FIRST. If a network delete fails, the local
+  // tombstone survives and the purge is retried on the next boot; deleting
+  // locally first would resurrect the entry on the next sync, because
+  // pullAll() pushes back anything local that's missing remotely.
+  for (const k of gone) await deleteDay(k);
+  gone.forEach(k => delete DB.entries[k]);
+  saveLocal();
+}
+
 async function pullAll() {
   if (!fbUser) return;
   setSync('syncing');
@@ -53,30 +103,27 @@ async function pullAll() {
     const snap = await col().get();
     const remote = {};
     snap.forEach(d => {
-      const clean = normalize(d.id, d.data());
+      const clean = cleanIncoming(d.id, d.data());
       if (clean) remote[clean.date] = clean;
     });
 
-    // Merge remote into local — newer updatedAt wins.
+    // Merge remote into local — newer updatedAt wins (mergeRemoteEntry in
+    // core.js, so the rule is unit-tested).
     for (const key of Object.keys(remote)) {
-      const clean = remote[key];
-      const local = DB.entries[key];
-      if (!local || (clean.updatedAt || 0) >= (local.updatedAt || 0)) DB.entries[key] = clean;
+      DB.entries[key] = mergeRemoteEntry(DB.entries[key], remote[key]);
     }
     saveLocal();
 
     // Push back anything local that's newer than, or missing from, the
     // remote copy. Without this, an offline edit — or any push that failed
     // and left syncState as 'offline' — sits on this device forever and
-    // Firestore (and every other device) never learns about it; the old
-    // logic only ever pushed on a completely empty first sync.
+    // Firestore (and every other device) never learns about it. Tombstoned
+    // entries push back too: that's how a delete propagates instead of the
+    // entry resurrecting on the next sync.
     const pushes = [];
     for (const key of Object.keys(DB.entries)) {
       const local = DB.entries[key];
-      const remoteEntry = remote[key];
-      if (!remoteEntry || (local.updatedAt || 0) > (remoteEntry.updatedAt || 0)) {
-        pushes.push(pushDay(local));
-      }
+      if (needsPush(local, remote[key])) pushes.push(pushDay(local));
     }
     await Promise.all(pushes);
 
@@ -84,125 +131,72 @@ async function pullAll() {
   } catch (err) { console.warn('sync failed', err); setSync('offline'); }
 }
 
-/* ─── Utils ───────────────────────────────────────────────────── */
+/* ─── HTML sanitizing ───────────────────────────────────────────
+   Imported backups — and, defense-in-depth, anything read back from
+   Firestore — pass through here before reaching innerHTML. Allow-list
+   only the markup the writer itself produces; dangerous elements are
+   dropped with their contents, unknown ones are unwrapped so their
+   text survives. Attributes never survive. ─────────────────────── */
+const SANITIZE_ALLOW = { P: 1, H2: 1, UL: 1, OL: 1, LI: 1, BLOCKQUOTE: 1, B: 1, STRONG: 1, I: 1, EM: 1, U: 1, BR: 1 };
+const SANITIZE_DROP = { SCRIPT: 1, STYLE: 1, IFRAME: 1, OBJECT: 1, EMBED: 1, LINK: 1, META: 1, SVG: 1, MATH: 1, FORM: 1, INPUT: 1, BUTTON: 1, SELECT: 1, TEXTAREA: 1, VIDEO: 1, AUDIO: 1, IMG: 1 };
+
+function sanitizeHtml(html) {
+  if (!html) return '';
+  let parsed;
+  try {
+    parsed = new DOMParser().parseFromString('<div>' + html + '</div>', 'text/html');
+  } catch { return ''; }
+  const root = parsed.body.firstElementChild;
+  if (!root) return '';
+  const walk = el => {
+    for (const child of Array.from(el.children)) {
+      const tag = child.tagName;
+      if (SANITIZE_DROP[tag]) { child.remove(); continue; }
+      // The allow-listed markup needs no attributes; none survive.
+      Array.from(child.attributes).forEach(a => child.removeAttribute(a.name));
+      walk(child);               // sanitize descendants BEFORE unwrapping
+      if (!SANITIZE_ALLOW[tag]) {
+        while (child.firstChild) el.insertBefore(child.firstChild, child);
+        child.remove();
+      }
+    }
+  };
+  walk(root);
+  return root.innerHTML;
+}
+
+// normalize() from core.js, plus the HTML pass. e.plain is always
+// inserted through esc() in templates, so sanitizing the html field
+// is sufficient.
+function cleanIncoming(key, raw) {
+  const e = normalize(key, raw);
+  if (e) e.html = sanitizeHtml(e.html);
+  return e;
+}
+
+/* ─── Utils (DOM-only; pure ones live in core.js) ─────────────── */
 
 const $ = id => document.getElementById(id);
 
-function esc(s) {
-  if (s == null) return '';
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const isKey = k => typeof k === 'string' && DATE_RE.test(k) && !isNaN(new Date(k + 'T00:00:00').getTime());
-
-function dkey(d) {
-  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
-}
-const todayKey = () => dkey(new Date());
-const parseKey = k => new Date(k + 'T00:00:00');
-
-function shiftKey(k, delta) {
-  const d = parseKey(k);
-  d.setDate(d.getDate() + delta);
-  return dkey(d);
-}
-function daysBetween(a, b) { return Math.round((parseKey(a) - parseKey(b)) / 86400000); }
-
-// Every formatter guards its input, so a malformed record can never
-// render as "Invalid Date".
-const fmt = {
-  full:  k => isKey(k) ? parseKey(k).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }) : '',
-  med:   k => isKey(k) ? parseKey(k).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }) : '',
-  short: k => isKey(k) ? parseKey(k).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '',
-  rel: k => {
-    if (!isKey(k)) return '';
-    const diff = daysBetween(todayKey(), k);
-    if (diff === 0) return 'Today';
-    if (diff === 1) return 'Yesterday';
-    if (diff === -1) return 'Tomorrow';
-    if (diff < 0) return 'Upcoming';
-    if (diff < 7) return diff + ' days ago';
-    const w = Math.floor(diff / 7);
-    if (w < 5) return w === 1 ? 'Last week' : w + ' weeks ago';
-    const m = Math.floor(diff / 30);
-    if (m < 12) return m === 1 ? 'Last month' : m + ' months ago';
-    const y = Math.floor(diff / 365);
-    return y === 1 ? 'Last year' : y + ' years ago';
-  },
-};
-
-function htmlToText(html) {
-  const d = document.createElement('div');
-  d.innerHTML = html || '';
-  return (d.textContent || '').replace(/\s+/g, ' ').trim();
-}
-function countWords(t) {
-  const s = (t || '').trim();
-  return s ? s.split(/\s+/).length : 0;
-}
-function toast(msg) {
+function toast(msg, action) {
   const t = $('toast');
-  t.textContent = msg;
+  t.innerHTML = esc(msg) + (action
+    ? ` <button type="button" class="toast-action" id="toast-action">${esc(action.label)}</button>`
+    : '');
   t.classList.add('show');
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => t.classList.remove('show'), 1900);
-}
-
-/* ─── Entry shape ─────────────────────────────────────────────── */
-
-// Coerce anything (older formats, partial records) into a valid entry,
-// or return null when there's no usable date.
-function normalize(key, raw) {
-  const src = raw || {};
-  const date = isKey(src.date) ? src.date : (isKey(key) ? key : null);
-  if (!date) return null;
-
-  let html = typeof src.html === 'string' ? src.html : '';
-  if (!html && typeof src.text === 'string' && src.text.trim()) {
-    html = src.text.split(/\n{2,}/).map(p => '<p>' + esc(p.trim()) + '</p>').join('');
+  if (action) {
+    const btn = $('toast-action');
+    if (btn) btn.onclick = () => {
+      t.classList.remove('show');
+      clearTimeout(toast._t);
+      action.onClick();
+    };
   }
-  const plain = typeof src.plain === 'string' && src.plain ? src.plain : htmlToText(html);
-  const photos = Array.isArray(src.photos) ? src.photos.filter(p => typeof p === 'string')
-    : (typeof src.photo === 'string' && src.photo ? [src.photo] : []);
-
-  return {
-    date,
-    title: typeof src.title === 'string' ? src.title : '',
-    html, plain,
-    mood: [1, 2, 3, 4, 5].includes(Number(src.mood)) ? Number(src.mood) : null,
-    tags: Array.isArray(src.tags) ? src.tags.filter(x => typeof x === 'string').slice(0, 20) : [],
-    photos,
-    favorite: !!src.favorite,
-    words: Number(src.words) || countWords(plain),
-    updatedAt: Number(src.updatedAt) || Number(src.timestamp) || Date.now(),
-  };
-}
-
-function blankEntry(date) {
-  return { date, title: '', html: '', plain: '', mood: null, tags: [],
-           photos: [], favorite: false, words: 0, updatedAt: Date.now() };
-}
-function isEmpty(e) {
-  return !e || (!e.title && !e.plain && !(e.photos || []).length && !e.mood && !(e.tags || []).length);
+  toast._t = setTimeout(() => t.classList.remove('show'), action ? 5000 : 1900);
 }
 
 /* ─── Moods ───────────────────────────────────────────────────── */
-
-// A diverging scale: two hues either side of a neutral midpoint, shared with
-// the Android app so a day looks the same in both. The old ramp had Good and
-// Great only ΔE 2.5 apart — visually one colour — and put amber as a third hue
-// on one arm, which made it read as a traffic light rather than a scale.
-// Dark mode uses its own steps (see moodColor): on a dark surface the extremes
-// have to be the BRIGHTEST, so the arms run the other way.
-const MOODS = [
-  { v: 1, l: 'Rough', c: '#DC2626', d: '#F87171' },
-  { v: 2, l: 'Low',   c: '#F87171', d: '#DC2626' },
-  { v: 3, l: 'Okay',  c: '#475569', d: '#A8B0BD' },
-  { v: 4, l: 'Good',  c: '#22D3EE', d: '#0891B2' },
-  { v: 5, l: 'Great', c: '#0891B2', d: '#67E8F9' },
-];
 
 // Every mood colour goes through here so the dark steps are never forgotten.
 function moodColor(v) {
@@ -210,94 +204,62 @@ function moodColor(v) {
   if (!m) return 'currentColor';
   return document.body.classList.contains('dark') ? m.d : m.c;
 }
-const mood = v => MOODS.find(m => m.v === v);
-
-const FACE = {
-  1: '<path d="M7 8.7L10 10"/><path d="M17 8.7L14 10"/><circle cx="8.7" cy="11.3" r="1" fill="currentColor" stroke="none"/><circle cx="15.3" cy="11.3" r="1" fill="currentColor" stroke="none"/><path d="M8 17.5Q12 13.3 16 17.5"/>',
-  2: '<circle cx="8.7" cy="10.8" r="1" fill="currentColor" stroke="none"/><circle cx="15.3" cy="10.8" r="1" fill="currentColor" stroke="none"/><path d="M8 16.2Q12 14.3 16 16.2"/>',
-  3: '<circle cx="8.7" cy="10.8" r="1" fill="currentColor" stroke="none"/><circle cx="15.3" cy="10.8" r="1" fill="currentColor" stroke="none"/><path d="M8 15L16 15"/>',
-  4: '<circle cx="8.7" cy="10.6" r="1" fill="currentColor" stroke="none"/><circle cx="15.3" cy="10.6" r="1" fill="currentColor" stroke="none"/><path d="M8 14Q12 16.6 16 14"/>',
-  5: '<path d="M7.4 10.6Q8.7 9.2 10 10.6"/><path d="M14 10.6Q15.3 9.2 16.6 10.6"/><path d="M7.5 13.6Q12 18.6 16.5 13.6"/>',
-};
-
-function moodSvg(v, size, color) {
-  const m = mood(v);
-  const c = color || (m ? moodColor(m.v) : 'currentColor');
-  return '<svg width="' + size + '" height="' + size + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
-    + 'stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="display:block;flex-shrink:0;color:' + c + '">'
-    + '<circle cx="12" cy="12" r="9"/>' + (FACE[v] || '') + '</svg>';
-}
-
-/* ─── Prompts ─────────────────────────────────────────────────── */
-
-const PROMPTS = [
-  "What's one thing that made you smile today?",
-  "What's weighing on your mind right now?",
-  "Describe a small win from today.",
-  "What are you grateful for in this moment?",
-  "What would make tomorrow feel like a good day?",
-  "Write about a conversation that stuck with you.",
-  "What's something you're avoiding, and why?",
-  "What did you learn about yourself this week?",
-  "Describe your energy today in three words, then explain.",
-  "What's one thing you'd tell your morning self?",
-  "What are you looking forward to?",
-  "What's a fear you can name out loud right now?",
-  "Who or what supported you today?",
-  "What did you do today that felt like 'you'?",
-  "What's a thought you keep circling back to?",
-  "If today had a title, what would it be?",
-  "What's something you need to let go of?",
-  "Describe a moment of calm from today.",
-  "What's a boundary you held, or wish you'd held?",
-  "What's one thing your body is telling you right now?",
-  "What surprised you today?",
-  "What's something you're proud of, even if small?",
-  "Write a note to yourself one year from now.",
-  "What pattern have you noticed in yourself lately?",
-  "What does rest look like for you right now?",
-  "What's a question you don't have the answer to yet?",
-  "Who do you want to reach out to, and why haven't you?",
-  "What's one thing you could simplify?",
-  "Describe today using the weather as a metaphor.",
-  "What did you do for someone else today?",
-];
-function promptFor(k) {
-  let h = 0;
-  for (let i = 0; i < k.length; i++) h = (h * 31 + k.charCodeAt(i)) >>> 0;
-  return PROMPTS[h % PROMPTS.length];
-}
 
 /* ─── Storage ─────────────────────────────────────────────────── */
 
-const LS = { entries: 'jr3_entries', theme: 'jr3_theme', prefs: 'jr3_prefs', pin: 'jr3_pin' };
+const LS = { theme: 'jr3_theme', prefs: 'jr3_prefs', pin: 'jr3_pin' };
 const DB = { entries: {}, prefs: { hidePrompt: false } };
 
-function loadLocal() {
+// Entry storage is namespaced per account (jr3_entries_<uid>). Without
+// this, a sign-out whose reload got interrupted would leave the previous
+// account's entries in a shared key for the next account on this browser.
+const entriesKey = () => fbUser ? 'jr3_entries_' + fbUser.uid : 'jr3_entries';
+
+function loadEntries() {
+  const key = entriesKey();
+  // One-time migration: entries written before per-account namespacing live
+  // under the shared 'jr3_entries' key. Adopt them into this account's
+  // namespaced key the first time that key is empty, then drop the old copy.
+  if (fbUser) {
+    const legacy = localStorage.getItem('jr3_entries');
+    if (legacy && !localStorage.getItem(key)) {
+      localStorage.setItem(key, legacy);
+    }
+    if (legacy) localStorage.removeItem('jr3_entries');
+  }
   let raw = {};
-  try { raw = JSON.parse(localStorage.getItem(LS.entries) || '{}'); } catch { raw = {}; }
+  try { raw = JSON.parse(localStorage.getItem(key) || '{}'); } catch { raw = {}; }
   DB.entries = {};
   Object.keys(raw).forEach(k => {
-    const clean = normalize(k, raw[k]);
+    const clean = cleanIncoming(k, raw[k]);
     if (clean) DB.entries[clean.date] = clean;
   });
+}
+function loadPrefs() {
   try {
     const p = JSON.parse(localStorage.getItem(LS.prefs) || 'null');
     if (p) DB.prefs = Object.assign(DB.prefs, p);
   } catch {}
-  // Retire storage from earlier builds so nothing stale leaks through
-  ['jr_entries', 'jr2_entries', 'jr2_journals', 'jr2_migrated', 'jr2_prefs', 'jr2_theme']
-    .forEach(k => localStorage.removeItem(k));
 }
+function loadLocal() { loadEntries(); loadPrefs(); }
+
 function saveLocal() {
   try {
-    localStorage.setItem(LS.entries, JSON.stringify(DB.entries));
+    localStorage.setItem(entriesKey(), JSON.stringify(DB.entries));
   } catch (err) {
     console.warn('local save failed', err);
     toast('Could not save on this device — storage may be full. Try removing a photo.');
   }
 }
 function savePrefs() { localStorage.setItem(LS.prefs, JSON.stringify(DB.prefs)); }
+
+// Retire storage from earlier builds so nothing stale leaks through.
+// ('jr3_entries' is deliberately NOT here — loadEntries() migrates it into
+// the per-account namespaced key after sign-in.)
+function retireLegacyKeys() {
+  ['jr_entries', 'jr2_entries', 'jr2_journals', 'jr2_migrated', 'jr2_prefs', 'jr2_theme']
+    .forEach(k => localStorage.removeItem(k));
+}
 
 /* ─── PIN lock ────────────────────────────────────────────────────
    A device-level lock screen, like a phone's PIN — not encryption.
@@ -378,6 +340,10 @@ function renderPinDots(filled, total) {
   const n = total || Math.max(filled, 1);
   $('pin-dots').innerHTML = Array.from({ length: n })
     .map((_, i) => `<span class="pin-dot${i < filled ? ' filled' : ''}"></span>`).join('');
+  // The dots themselves carry no text, so a visually-hidden live region is
+  // what actually gets announced to screen readers as digits are entered.
+  const progress = $('pin-progress');
+  if (progress) progress.textContent = filled + ' of ' + n + ' digits entered';
 }
 function updatePinContinue() {
   const btn = $('pin-continue');
@@ -546,7 +512,7 @@ async function lockAppNow() {
   render();
 }
 
-const allEntries = () => Object.values(DB.entries).filter(e => isKey(e.date));
+const allEntries = () => Object.values(DB.entries).filter(e => isKey(e.date) && !e.deleted);
 const sortedDesc = list => list.slice().sort((a, b) => a.date < b.date ? 1 : -1);
 
 function allTags() {
@@ -555,21 +521,7 @@ function allTags() {
   return Object.keys(c).sort((a, b) => c[b] - c[a]).map(t => ({ tag: t, n: c[t] }));
 }
 
-function streaks() {
-  const days = new Set(allEntries().map(e => e.date));
-  if (!days.size) return { current: 0, longest: 0 };
-  const sorted = Array.from(days).sort();
-  let longest = 0, run = 0, prev = null;
-  sorted.forEach(k => {
-    run = prev && daysBetween(k, prev) === 1 ? run + 1 : 1;
-    longest = Math.max(longest, run);
-    prev = k;
-  });
-  let current = 0, cur = todayKey();
-  if (!days.has(cur)) cur = shiftKey(cur, -1);
-  while (days.has(cur)) { current++; cur = shiftKey(cur, -1); }
-  return { current, longest };
-}
+const streaks = () => computeStreaks(allEntries().map(e => e.date), todayKey());
 
 /* ─── State ───────────────────────────────────────────────────── */
 
@@ -579,6 +531,7 @@ const state = {
   draft: null,        // working copy for that day
   search: '',
   tagFilter: null,
+  favFilter: false,
   calMonth: new Date().getMonth(),
   calYear: new Date().getFullYear(),
 };
@@ -616,13 +569,20 @@ function openDay(key) {
   render();
 }
 
+// The stored entry for this day, ignoring tombstones: opening a trashed
+// day shows a blank writer, and writing into it restores the entry.
+function liveEntry(key) {
+  const e = DB.entries[key];
+  return e && !e.deleted ? e : null;
+}
+
 /* ─── Write view ──────────────────────────────────────────────── */
 
 let saveTimer = null;
 
 function renderWrite() {
   const key = state.date;
-  const existing = DB.entries[key];
+  const existing = liveEntry(key);
   state.draft = existing ? JSON.parse(JSON.stringify(existing)) : blankEntry(key);
   const e = state.draft;
 
@@ -683,7 +643,7 @@ function renderWrite() {
         <span class="save-hint" id="save-hint"></span>
       </div>
 
-      <div id="w-body" class="w-body" contenteditable="true" data-placeholder="Start writing…">${e.html || ''}</div>
+      <div id="w-body" class="w-body" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Journal entry text" data-placeholder="Start writing…">${e.html || ''}</div>
 
       <div class="photo-grid" id="photo-grid"></div>
 
@@ -724,19 +684,19 @@ function onThisDay(key) {
   const hits = [];
   for (let y = 1; y <= 6; y++) {
     const k = dkey(new Date(d.getFullYear() - y, d.getMonth(), d.getDate()));
-    const e = DB.entries[k];
+    const e = liveEntry(k);
     if (e) hits.push({ k, e, y });
   }
   if (!hits.length) return '';
   return `<div class="card">
     <div class="card-title">On this day</div>
-    ${hits.map(h => `<button class="otd" data-open="${h.k}">
+    ${hits.map(h => `<div class="otd" data-open="${h.k}" role="button" tabindex="0" aria-label="${h.y} year${h.y > 1 ? 's' : ''} ago, ${esc(h.e.title || h.e.plain || 'no text')}">
       <div class="otd-head">
         ${h.e.mood ? moodSvg(h.e.mood, 15) : ''}
         <span>${h.y} year${h.y > 1 ? 's' : ''} ago</span>
       </div>
       <div class="otd-text">${esc(h.e.title || h.e.plain || 'No text')}</div>
-    </button>`).join('')}
+    </div>`).join('')}
   </div>`;
 }
 
@@ -747,7 +707,17 @@ function wireDayNav() {
   const jt = $('jump-today');
   if (jt) jt.onclick = () => openDay(todayKey());
   $('day-pick').onclick = openDatePicker;
-  document.querySelectorAll('[data-open]').forEach(b => { b.onclick = () => openDay(b.dataset.open); });
+  wireOpenTargets();
+}
+
+function wireOpenTargets() {
+  document.querySelectorAll('[data-open]').forEach(b => {
+    const open = () => openDay(b.dataset.open);
+    b.onclick = open;
+    b.onkeydown = ev => {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); open(); }
+    };
+  });
 }
 
 function openDatePicker() {
@@ -784,7 +754,7 @@ function openDatePicker() {
 function renderMoods() {
   const e = state.draft;
   $('mood-strip').innerHTML = MOODS.map(m => `
-    <button class="mood-btn${e.mood === m.v ? ' on' : ''}" data-m="${m.v}" style="${e.mood === m.v ? 'color:' + moodColor(m.v) : ''}">
+    <button class="mood-btn${e.mood === m.v ? ' on' : ''}" data-m="${m.v}" aria-pressed="${e.mood === m.v}" style="${e.mood === m.v ? 'color:' + moodColor(m.v) : ''}">
       ${moodSvg(m.v, 23)}<span>${m.l}</span>
     </button>`).join('');
   document.querySelectorAll('#mood-strip .mood-btn').forEach(b => {
@@ -810,7 +780,7 @@ function renderPhotos() {
   const e = state.draft;
   $('photo-grid').innerHTML = (e.photos || []).map((p, i) => `
     <div class="photo-item">
-      <img src="${p}" data-lb="${i}" alt="">
+      <img src="${esc(p)}" data-lb="${i}" alt="">
       <button class="photo-del" data-rmp="${i}" aria-label="Remove photo">
         <svg viewBox="0 0 24 24" class="ic"><path d="M18 6L6 18M6 6l12 12"/></svg>
       </button>
@@ -840,19 +810,47 @@ function readDraft() {
   e.updatedAt = Date.now();
 }
 
-function commitDraft() {
+// opts.localOnly: skip the Firestore push. Used on page unload, where an
+// async write is a lost race anyway — localStorage is written synchronously
+// by saveLocal(), and the next boot's pullAll() pushback carries it up.
+// Returns {deleted:true} when it moved a stored entry to the trash, or the
+// pushDay promise for the normal save path (so callers can await the push).
+function commitDraft(opts) {
   const e = state.draft;
-  if (!e || !isKey(e.date)) return;
+  if (!e || !isKey(e.date)) return null;
   readDraft();
-  const had = !!DB.entries[e.date];
+  const stored = DB.entries[e.date];
+  const had = !!(stored && !stored.deleted);
 
   if (isEmpty(e)) {
-    if (had) { delete DB.entries[e.date]; saveLocal(); deleteDay(e.date); }
-    return;
+    if (had) {
+      // Clearing an existing entry is almost always an accident (a stray
+      // select-all + delete), which is exactly what the trash exists for:
+      // tombstone it — undoable from the toast, restorable for 30 days —
+      // and never hard-delete here. Only purgeTrash() removes documents.
+      clearTimeout(saveTimer);
+      DB.entries[e.date] = applyTombstone(stored, Date.now());
+      saveLocal();
+      const push = (opts && opts.localOnly) ? null : pushDay(DB.entries[e.date]);
+      state.draft = blankEntry(e.date);
+      toast('Entry moved to trash', { label: 'Undo', onClick: () => {
+        restoreEntry(e.date);
+        if (state.date === e.date) {
+          state.draft = JSON.parse(JSON.stringify(DB.entries[e.date]));
+        }
+        render();
+      } });
+      return push ? push.then(() => ({ deleted: true })) : { deleted: true };
+    }
+    return null;
   }
-  DB.entries[e.date] = JSON.parse(JSON.stringify(e));
+  const finished = JSON.parse(JSON.stringify(e));
+  delete finished.deleted;      // writing into a trashed day restores it
+  delete finished.deletedAt;
+  DB.entries[e.date] = finished;
   saveLocal();
-  pushDay(DB.entries[e.date]);
+  if (opts && opts.localOnly) return null;
+  return pushDay(finished);
 }
 
 function scheduleSave() {
@@ -860,10 +858,21 @@ function scheduleSave() {
   const hint = $('save-hint');
   if (hint) hint.textContent = 'Saving…';
   saveTimer = setTimeout(() => {
-    commitDraft();
-    const h = $('save-hint');
-    if (h) { h.textContent = 'Saved'; setTimeout(() => { if ($('save-hint')) $('save-hint').textContent = ''; }, 1300); }
-    $('streak-count').textContent = streaks().current;
+    const result = commitDraft();
+    // The hint must reflect the FIRESTORE result, not just the local write:
+    // commitDraft returns the pushDay promise, so by the time it settles
+    // syncState says truthfully whether the push made it.
+    const done = () => {
+      const h = $('save-hint');
+      if (h) {
+        h.textContent = syncState === 'offline' ? 'Saved on this device' : 'Saved';
+        setTimeout(() => { if ($('save-hint')) $('save-hint').textContent = ''; }, 1300);
+      }
+      $('streak-count').textContent = streaks().current;
+    };
+    if (result && typeof result.then === 'function') result.then(done, done);
+    else if (!result || !result.deleted) done();
+    else $('streak-count').textContent = streaks().current;
   }, 900);
 }
 
@@ -926,10 +935,16 @@ function wireWriter() {
   if (del) del.onclick = () => {
     if (!confirm('Delete this entry?')) return;
     clearTimeout(saveTimer);
-    delete DB.entries[state.date];
-    saveLocal(); deleteDay(state.date);
-    state.draft = blankEntry(state.date);
-    toast('Entry deleted');
+    const key = state.date;
+    softDeleteEntry(key);
+    state.draft = blankEntry(key);
+    toast('Entry deleted', { label: 'Undo', onClick: () => {
+      restoreEntry(key);
+      if (state.date === key) {
+        state.draft = JSON.parse(JSON.stringify(DB.entries[key]));
+      }
+      render();
+    } });
     render();
   };
 
@@ -961,40 +976,102 @@ function syncFormatBar() {
 }
 
 function compressImage(file) {
+  const looksHeic = /image\/hei[cf]/i.test(file.type) || /\.(heic|heif)$/i.test(file.name || '');
+
+  const sizedTo = (naturalW, naturalH) => {
+    const max = 1400;
+    let w = naturalW, h = naturalH;
+    if (w > max || h > max) {
+      if (w > h) { h = Math.round(h * max / w); w = max; }
+      else { w = Math.round(w * max / h); h = max; }
+    }
+    return [w, h];
+  };
+  const draw = (source, w, h) => {
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    c.getContext('2d').drawImage(source, 0, 0, w, h);
+    let q = 0.8, out = c.toDataURL('image/jpeg', q);
+    while (out.length > 320000 && q > 0.28) { q -= 0.1; out = c.toDataURL('image/jpeg', q); }
+    return out;
+  };
+
   return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = ev => {
-      const img = new Image();
-      img.onload = () => {
-        const max = 1400;
-        let w = img.width, h = img.height;
-        if (w > max || h > max) {
-          if (w > h) { h = Math.round(h * max / w); w = max; }
-          else { w = Math.round(w * max / h); h = max; }
-        }
-        const c = document.createElement('canvas');
-        c.width = w; c.height = h;
-        c.getContext('2d').drawImage(img, 0, 0, w, h);
-        let q = 0.8, out = c.toDataURL('image/jpeg', q);
-        while (out.length > 320000 && q > 0.28) { q -= 0.1; out = c.toDataURL('image/jpeg', q); }
-        resolve(out);
+    const fail = () => reject(new Error(looksHeic ? 'heic' : 'decode'));
+
+    function legacyDecode() {
+      const r = new FileReader();
+      r.onload = ev => {
+        const img = new Image();
+        img.onload = () => { const [w, h] = sizedTo(img.width, img.height); resolve(draw(img, w, h)); };
+        img.onerror = fail;
+        img.src = ev.target.result;
       };
-      img.onerror = reject;
-      img.src = ev.target.result;
-    };
-    r.onerror = reject;
-    r.readAsDataURL(file);
+      r.onerror = fail;
+      r.readAsDataURL(file);
+    }
+
+    // createImageBitmap with imageOrientation:'from-image' rotates/flips the
+    // decoded pixels to match the file's EXIF orientation tag before
+    // anything is drawn. The FileReader+Image path below doesn't apply EXIF
+    // orientation on every browser, so a portrait phone photo could import
+    // sideways — this is the fix, with that path kept only as a fallback for
+    // browsers (Safari < 15) that don't support the option.
+    if (window.createImageBitmap) {
+      createImageBitmap(file, { imageOrientation: 'from-image' }).then(bmp => {
+        const [w, h] = sizedTo(bmp.width, bmp.height);
+        const out = draw(bmp, w, h);
+        if (bmp.close) bmp.close();
+        resolve(out);
+      }).catch(legacyDecode);
+    } else {
+      legacyDecode();
+    }
   });
+}
+
+/* ─── Photos: Firebase Storage ──────────────────────────────────
+   A Firestore document caps at 1 MiB — ten ~320 KB base64 photos blow
+   past that and pushes start failing. So each compressed photo is
+   uploaded to Storage and the entry keeps only its download URL.
+   Legacy entries still carrying base64 data URLs keep working (they
+   render as-is); the limit now only bites on very old entries. ── */
+
+async function uploadPhoto(date, dataUrl) {
+  if (!fbUser || !(firebase.storage && firebase.storage())) throw new Error('storage unavailable');
+  const name = randomHex(10) + '.jpg';
+  const ref = firebase.storage().ref('users/' + fbUser.uid + '/journalDays/' + date + '/' + name);
+  await ref.putString(dataUrl, 'data_url');
+  return ref.getDownloadURL();
 }
 
 async function addPhotos(files) {
   const e = state.draft;
   if (!e) return;
   e.photos = e.photos || [];
+  let keptInline = 0;
   for (const f of Array.from(files)) {
     if (e.photos.length >= 10) { toast('Up to 10 photos per entry'); break; }
-    try { e.photos.push(await compressImage(f)); } catch { toast('Could not read that image'); }
+    try {
+      const dataUrl = await compressImage(f);
+      let stored = dataUrl;
+      try {
+        stored = await uploadPhoto(e.date, dataUrl);
+      } catch (err) {
+        // Offline or a Storage hiccup: keep the compressed inline copy so the
+        // photo isn't lost — but warn below, because an inline copy can push
+        // the day past Firestore's 1 MiB document cap and stop that day syncing.
+        console.warn('photo upload failed; keeping inline copy', err);
+        keptInline++;
+      }
+      e.photos.push(stored);
+    } catch (err) {
+      toast(err && err.message === 'heic'
+        ? "HEIC photos aren't supported yet — try converting to JPEG first"
+        : 'Could not read that image');
+    }
   }
+  if (keptInline) toast("Couldn't upload " + (keptInline === 1 ? 'a photo' : keptInline + ' photos') + ' to cloud storage — kept inline; that day may not sync until the photo is removed');
   renderPhotos();
   scheduleSave();
 }
@@ -1003,10 +1080,12 @@ async function addPhotos(files) {
 
 function renderEntries() {
   const q = state.search.trim().toLowerCase();
+  const anyFilter = state.tagFilter || state.favFilter || q;
   let list = sortedDesc(allEntries().filter(e => {
     if (state.tagFilter && !(e.tags || []).includes(state.tagFilter)) return false;
+    if (state.favFilter && !e.favorite) return false;
     if (q) {
-      const hay = ((e.title || '') + ' ' + (e.plain || '') + ' ' + (e.tags || []).join(' ')).toLowerCase();
+      const hay = ((e.title || '') + ' ' + (e.plain || '') + ' ' + moodLabel(e.mood) + ' ' + (e.tags || []).join(' ')).toLowerCase();
       if (!hay.includes(q)) return false;
     }
     return true;
@@ -1014,27 +1093,44 @@ function renderEntries() {
 
   const tags = allTags().slice(0, 10);
 
+  // Month headers make a long, plain-browse list scannable. Since `list` is
+  // already newest-first and dates are unique, a header only needs to go up
+  // whenever the month actually changes as we walk down it.
+  let cardsHtml = '';
+  let lastMonth = null;
+  for (const e of list) {
+    const label = parseKey(e.date).toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+    if (label !== lastMonth) {
+      cardsHtml += `<div class="month-head">${esc(label)}</div>`;
+      lastMonth = label;
+    }
+    cardsHtml += entryCard(e);
+  }
+
   content().innerHTML = `
     <div class="page-head">
       <div class="page-title">Entries</div>
-      <div class="page-sub">${list.length} ${list.length === 1 ? 'entry' : 'entries'}${state.tagFilter ? ' tagged #' + esc(state.tagFilter) : ''}</div>
+      <div class="page-sub">${list.length} ${list.length === 1 ? 'entry' : 'entries'}${state.tagFilter ? ' tagged #' + esc(state.tagFilter) : ''}${state.favFilter ? ' · favorites' : ''}</div>
     </div>
 
     <div class="search-wrap">
       <svg viewBox="0 0 24 24" class="ic search-ic"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.1-4.1"/></svg>
-      <input type="search" id="search-input" class="search-input" placeholder="Search your entries…" value="${esc(state.search)}" />
+      <input type="search" id="search-input" class="search-input" aria-label="Search your entries" placeholder="Search your entries…" value="${esc(state.search)}" />
+      <button type="button" class="fav-filter-btn${state.favFilter ? ' on' : ''}" id="fav-filter" aria-pressed="${state.favFilter}" aria-label="Show favorites only" title="Show favorites only">
+        <svg viewBox="0 0 24 24" class="ic"><path d="M12 17.75l-6.17 3.24 1.18-6.87-5-4.86 6.9-1L12 2l3.09 6.26 6.9 1-5 4.86 1.18 6.87z"/></svg>
+      </button>
     </div>
 
     ${tags.length ? `<div class="tag-row">
       ${tags.map(t => `<button class="tag-chip${state.tagFilter === t.tag ? ' on' : ''}" data-tag="${esc(t.tag)}">#${esc(t.tag)} <span>${t.n}</span></button>`).join('')}
     </div>` : ''}
 
-    ${list.length ? list.map(entryCard).join('') : `
+    ${list.length ? cardsHtml : `
       <div class="empty">
         <div class="empty-ic"><svg viewBox="0 0 24 24" class="ic" style="width:30px;height:30px"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></div>
-        <h3>${q || state.tagFilter ? 'Nothing matches' : 'No entries yet'}</h3>
-        <p>${q || state.tagFilter ? 'Try a different search or clear the filter.' : 'Head to Write and put down a line about today.'}</p>
-        ${q || state.tagFilter ? '' : '<button class="btn-primary" id="empty-write">Start writing</button>'}
+        <h3>${anyFilter ? 'Nothing matches' : 'No entries yet'}</h3>
+        <p>${anyFilter ? 'Try a different search or clear the filter.' : 'Head to Write and put down a line about today.'}</p>
+        ${anyFilter ? '' : '<button class="btn-primary" id="empty-write">Start writing</button>'}
       </div>`}`;
 
   const si = $('search-input');
@@ -1047,7 +1143,8 @@ function renderEntries() {
   document.querySelectorAll('[data-tag]').forEach(b => {
     b.onclick = () => { state.tagFilter = state.tagFilter === b.dataset.tag ? null : b.dataset.tag; renderEntries(); };
   });
-  document.querySelectorAll('[data-open]').forEach(b => { b.onclick = () => openDay(b.dataset.open); });
+  $('fav-filter').onclick = () => { state.favFilter = !state.favFilter; renderEntries(); };
+  wireOpenTargets();
   const ew = $('empty-write');
   if (ew) ew.onclick = () => go('write');
 }
@@ -1055,8 +1152,11 @@ function renderEntries() {
 function entryCard(e) {
   const m = mood(e.mood);
   const photos = e.photos || [];
+  // A <div role="button"> rather than a <button> — buttons may only contain
+  // phrasing content, and this card nests divs and images. wireOpenTargets()
+  // gives it the same click/Enter/Space behaviour a real button would have.
   return `
-    <button class="entry-card" data-open="${e.date}">
+    <div class="entry-card" data-open="${e.date}" role="button" tabindex="0" aria-label="${esc(fmt.full(e.date))}${e.title ? ', ' + esc(e.title) : ''}">
       <div class="ec-top">
         ${m ? moodSvg(m.v, 17) : ''}
         <span class="ec-date">${esc(fmt.med(e.date))}</span>
@@ -1064,16 +1164,16 @@ function entryCard(e) {
         ${e.favorite ? '<span class="ec-star"><svg viewBox="0 0 24 24" class="ic"><path d="M12 17.75l-6.17 3.24 1.18-6.87-5-4.86 6.9-1L12 2l3.09 6.26 6.9 1-5 4.86 1.18 6.87z"/></svg></span>' : ''}
       </div>
       ${e.title ? `<div class="ec-title">${esc(e.title)}</div>` : ''}
-      <div class="ec-preview">${e.plain ? esc(e.plain.slice(0, 220)) : '<span style="color:var(--text-3)">No text</span>'}</div>
+      <div class="ec-preview">${e.plain ? esc(truncateWords(e.plain, 220)) : '<span style="color:var(--text-3)">No text</span>'}</div>
       ${photos.length ? `<div class="ec-thumbs">
-        ${photos.slice(0, 3).map(p => `<img src="${p}" alt="">`).join('')}
+        ${photos.slice(0, 3).map(p => `<img src="${esc(p)}" alt="">`).join('')}
         ${photos.length > 3 ? `<div class="ec-thumb-more">+${photos.length - 3}</div>` : ''}
       </div>` : ''}
       <div class="ec-foot">
         ${(e.tags || []).slice(0, 4).map(t => `<span class="ec-tag">#${esc(t)}</span>`).join('')}
         <span class="ec-meta">${e.words || 0} words</span>
       </div>
-    </button>`;
+    </div>`;
 }
 
 /* ─── Calendar ────────────────────────────────────────────────── */
@@ -1087,7 +1187,9 @@ function renderCalendar() {
   const days = new Date(y, m + 1, 0).getDate();
 
   let written = 0;
-  for (let d = 1; d <= days; d++) if (DB.entries[dkey(new Date(y, m, d))]) written++;
+  for (let d = 1; d <= days; d++) {
+    if (liveEntry(dkey(new Date(y, m, d)))) written++;
+  }
 
   content().innerHTML = `
     <div class="page-head">
@@ -1106,7 +1208,7 @@ function renderCalendar() {
         ${Array.from({ length: days }).map((_, i) => {
           const day = i + 1;
           const k = dkey(new Date(y, m, day));
-          const e = DB.entries[k];
+          const e = liveEntry(k);
           const isToday = k === todayKey();
           const future = daysBetween(todayKey(), k) < 0;
           const mc = e && e.mood ? moodColor(e.mood) : null;
@@ -1144,7 +1246,10 @@ function renderInsights() {
 
   const last30 = [];
   for (let i = 29; i >= 0; i--) last30.push(shiftKey(todayKey(), -i));
-  const moodSeries = last30.map(k => (DB.entries[k] && DB.entries[k].mood) || null);
+  const moodSeries = last30.map(k => {
+    const e = liveEntry(k);
+    return e ? e.mood : null;
+  });
   const valid = moodSeries.filter(v => v != null);
   const avg = valid.length ? (valid.reduce((a, b) => a + b, 0) / valid.length).toFixed(1) : '—';
 
@@ -1152,7 +1257,7 @@ function renderInsights() {
   // number means something instead of floating on its own.
   const prev30 = [];
   for (let i = 59; i >= 30; i--) prev30.push(shiftKey(todayKey(), -i));
-  const prevValid = prev30.map(k => (DB.entries[k] && DB.entries[k].mood) || null).filter(v => v != null);
+  const prevValid = prev30.map(k => { const e = liveEntry(k); return e ? e.mood : null; }).filter(v => v != null);
   const prevAvg = prevValid.length ? prevValid.reduce((a, b) => a + b, 0) / prevValid.length : null;
   let trendHtml = '';
   if (valid.length && prevAvg != null) {
@@ -1236,14 +1341,16 @@ function renderInsights() {
         <span class="heat-cell" style="background:#6366F1"></span><span>Wrote</span></div>
     </div>`;
 
-  if (valid.length) drawMoodChart(moodSeries);
+  if (valid.length) drawMoodChart(moodSeries, last30);
   buildHeatmap();
 }
 
 let moodChartVals = null;
+let moodChartDates = null;
 
-function drawMoodChart(vals) {
+function drawMoodChart(vals, dates) {
   if (vals) moodChartVals = vals;
+  if (dates) moodChartDates = dates;
   const series = moodChartVals;
   const canvas = $('mood-chart');
   if (!canvas || !series) return;
@@ -1314,6 +1421,51 @@ function drawMoodChart(vals) {
     ctx.beginPath(); ctx.arc(p[0], p[1], 2.8, 0, Math.PI * 2);
     ctx.fillStyle = accent; ctx.fill();
   });
+
+  canvas._chartGeom = { padL, gw, n, series, dates: moodChartDates };
+  wireChartTooltip(canvas);
+}
+
+function wireChartTooltip(canvas) {
+  if (canvas._tipWired) return;
+  canvas._tipWired = true;
+
+  const nearest = clientX => {
+    const g = canvas._chartGeom;
+    if (!g) return null;
+    const rect = canvas.getBoundingClientRect();
+    const x = clientX - rect.left;
+    let idx = g.n > 1 ? Math.round(((x - g.padL) / g.gw) * (g.n - 1)) : 0;
+    idx = Math.max(0, Math.min(g.n - 1, idx));
+    return { idx, rect };
+  };
+  const showFor = clientX => {
+    const hit = nearest(clientX);
+    if (!hit) return;
+    const { idx, rect } = hit;
+    const v = canvas._chartGeom.series[idx];
+    if (v == null) { hideFloatingTip(); return; }
+    const dates = canvas._chartGeom.dates;
+    const dateLabel = dates && dates[idx] ? fmt.med(dates[idx]) : '';
+    const m = mood(v);
+    const x = rect.left + rect.width * (canvas._chartGeom.n > 1 ? idx / (canvas._chartGeom.n - 1) : 0.5);
+    showFloatingTip(x, rect.top, dateLabel + (m ? ' · ' + m.l : ''));
+  };
+
+  canvas.addEventListener('mousemove', ev => showFor(ev.clientX));
+  canvas.addEventListener('mouseleave', hideFloatingTip);
+  canvas.addEventListener('touchstart', ev => {
+    const t = ev.touches[0];
+    if (t) showFor(t.clientX);
+  }, { passive: true });
+  canvas.addEventListener('touchmove', ev => {
+    const t = ev.touches[0];
+    if (t) showFor(t.clientX);
+  }, { passive: true });
+  canvas.addEventListener('touchend', () => {
+    clearTimeout(showFloatingTip._hideT);
+    showFloatingTip._hideT = setTimeout(hideFloatingTip, 1200);
+  });
 }
 
 function buildHeatmap() {
@@ -1341,12 +1493,47 @@ function buildHeatmap() {
       <div class="heat-grid">
         ${mo.cells.map(d => {
           if (d > today) return '<div class="heat-cell" style="background:transparent"></div>';
-          const k = dkey(d), e = DB.entries[k];
+          const k = dkey(d), e = liveEntry(k);
           const bg = e ? (e.mood ? moodColor(e.mood) : '#6366F1') : 'var(--surface-3)';
-          return `<div class="heat-cell" style="background:${bg}" title="${esc(fmt.short(k))}${e ? ' · wrote' : ''}"></div>`;
+          const tip = esc(fmt.short(k)) + (e ? ' · wrote' : '');
+          return `<div class="heat-cell" style="background:${bg}" title="${tip}" data-tip="${tip}"></div>`;
         }).join('')}
       </div>
     </div>`).join('');
+
+  // title="" never fires on touch — tapping a cell shows the same text in a
+  // floating tooltip instead, so the heatmap is legible on a phone too.
+  wrap.querySelectorAll('.heat-cell[data-tip]').forEach(c => {
+    c.addEventListener('click', () => {
+      const r = c.getBoundingClientRect();
+      showFloatingTip(r.left + r.width / 2, r.top, c.dataset.tip);
+      clearTimeout(showFloatingTip._hideT);
+      showFloatingTip._hideT = setTimeout(hideFloatingTip, 2200);
+    });
+  });
+}
+
+/* ─── Floating tooltip ────────────────────────────────────────────
+   One shared tooltip element for anything that can't rely on a native
+   title="" (which never fires on touch): heatmap cells (tap) and the
+   mood chart (hover or drag). ─────────────────────────────────────── */
+
+function showFloatingTip(x, y, text) {
+  let tip = document.getElementById('float-tip');
+  if (!tip) {
+    tip = document.createElement('div');
+    tip.id = 'float-tip';
+    tip.className = 'float-tip';
+    document.body.appendChild(tip);
+  }
+  tip.textContent = text;
+  tip.style.left = x + 'px';
+  tip.style.top = y + 'px';
+  tip.classList.add('show');
+}
+function hideFloatingTip() {
+  const tip = document.getElementById('float-tip');
+  if (tip) tip.classList.remove('show');
 }
 
 /* ─── Settings ────────────────────────────────────────────────── */
@@ -1354,7 +1541,7 @@ function buildHeatmap() {
 function renderSettings() {
   const u = fbAuth.currentUser;
   const av = u && u.photoURL
-    ? `<img src="${u.photoURL}" referrerpolicy="no-referrer" alt="">`
+    ? `<img src="${esc(u.photoURL)}" referrerpolicy="no-referrer" alt="">`
     : esc(((u && u.email) || 'U')[0].toUpperCase());
 
   content().innerHTML = `
@@ -1382,8 +1569,8 @@ function renderSettings() {
         <button class="btn-secondary" id="toggle-prompt">${DB.prefs.hidePrompt ? 'Off' : 'On'}</button>
       </div>
       <div class="set-row">
-        <div><div class="lbl">Appearance</div><p>Light or dark</p></div>
-        <button class="btn-secondary" id="toggle-theme-2">${document.body.classList.contains('dark') ? 'Dark' : 'Light'}</button>
+        <div><div class="lbl">Appearance</div><p>Auto follows this device's setting</p></div>
+        <button class="btn-secondary" id="toggle-theme-2">${themeLabel()}</button>
       </div>
     </div>
 
@@ -1415,10 +1602,20 @@ function renderSettings() {
         <label class="btn-secondary" style="cursor:pointer">Import<input type="file" id="import" accept="application/json" hidden></label>
       </div>
       <div class="set-row">
-        <div><div class="lbl">Delete everything</div><p>Removes all entries here and in the cloud. Can't be undone.</p></div>
+        <div><div class="lbl">Delete everything</div><p>Kept for 30 days before it's gone for good — see Recently deleted below.</p></div>
         <button class="btn-ghost-danger" id="wipe">Delete</button>
       </div>
     </div>
+
+    ${trashedEntries().length ? `<div class="card">
+      <div class="card-title">Recently deleted</div>
+      <p class="muted-note" style="margin-bottom:10px">Removed for good after ${TRASH_DAYS} days.</p>
+      ${trashedEntries().map(e => `
+      <div class="set-row">
+        <div><div class="lbl">${esc(fmt.med(e.date))}</div><p>${esc(e.title || (e.plain ? e.plain.slice(0, 60) : 'No text'))}</p></div>
+        <button class="btn-secondary" data-restore="${e.date}">Restore</button>
+      </div>`).join('')}
+    </div>` : ''}
 
     <p class="foot-note">Your entries are private to your account.</p>`;
 
@@ -1426,7 +1623,7 @@ function renderSettings() {
 
   $('signout').onclick = () => fbAuth.signOut().then(() => location.reload());
   $('toggle-prompt').onclick = () => { DB.prefs.hidePrompt = !DB.prefs.hidePrompt; savePrefs(); renderSettings(); };
-  $('toggle-theme-2').onclick = () => { toggleTheme(); renderSettings(); };
+  $('toggle-theme-2').onclick = () => { cycleTheme(); renderSettings(); };
 
   $('pin-toggle').onclick = async () => {
     const ok = hasPinLock() ? await disablePinFlow() : await createPinFlow();
@@ -1438,7 +1635,9 @@ function renderSettings() {
   if (pinLockNow) pinLockNow.onclick = () => lockAppNow();
 
   $('export').onclick = () => {
-    const payload = { version: 3, exportedAt: new Date().toISOString(), entries: DB.entries };
+    const liveEntries = {};
+    allEntries().forEach(e => { liveEntries[e.date] = e; });
+    const payload = { version: 3, exportedAt: new Date().toISOString(), entries: liveEntries };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -1456,16 +1655,22 @@ function renderSettings() {
       try {
         const data = JSON.parse(x.target.result);
         const incoming = data.entries || data;
-        let n = 0;
+        let imported = 0, skipped = 0;
         for (const k of Object.keys(incoming)) {
-          const clean = normalize(k, incoming[k]);
+          const clean = cleanIncoming(k, incoming[k]);
           if (!clean) continue;
+          // An old backup must never clobber a newer edit: only entries that
+          // are unknown here or strictly newer than what we have are written.
+          // (Same updatedAt-wins rule as pullAll's merge.)
+          const existing = DB.entries[clean.date];
+          if (existing && (existing.updatedAt || 0) > (clean.updatedAt || 0)) { skipped++; continue; }
           DB.entries[clean.date] = clean;
           await pushDay(clean);
-          n++;
+          imported++;
         }
         saveLocal();
-        toast('Imported ' + n + (n === 1 ? ' entry' : ' entries'));
+        toast('Imported ' + imported + (imported === 1 ? ' entry' : ' entries')
+          + (skipped ? ' · skipped ' + skipped + ' (newer version kept)' : ''));
         render();
       } catch { toast('That file could not be read'); }
     };
@@ -1474,21 +1679,58 @@ function renderSettings() {
   };
 
   $('wipe').onclick = async () => {
-    if (!confirm('Delete every entry, everywhere? This cannot be undone.')) return;
-    const keys = Object.keys(DB.entries);
-    DB.entries = {};
+    if (!confirm("Delete every entry, everywhere? You'll get a chance to undo right after, and deleted entries are kept for 30 days before they're removed for good.")) return;
+    const keys = Object.keys(DB.entries).filter(k => !DB.entries[k].deleted);
+    const now = Date.now();
+    keys.forEach(k => { DB.entries[k] = applyTombstone(DB.entries[k], now); });
     saveLocal();
-    for (const k of keys) await deleteDay(k);
-    toast('All entries deleted');
+    for (const k of keys) await pushDay(DB.entries[k]);
     state.date = todayKey();
+    toast('All entries deleted', { label: 'Undo', onClick: () => {
+      keys.forEach(restoreEntry);
+      toast('Restored');
+      render();
+    } });
     render();
   };
+
+  document.querySelectorAll('[data-restore]').forEach(b => {
+    b.onclick = () => { restoreEntry(b.dataset.restore); renderSettings(); };
+  });
 }
 
 /* ─── Modal / lightbox / theme ────────────────────────────────── */
 
-function openModal()  { $('modal-backdrop').classList.add('open'); }
-function closeModal() { $('modal-backdrop').classList.remove('open'); }
+let modalReturnFocus = null;
+
+function openModal() {
+  const bd = $('modal-backdrop');
+  modalReturnFocus = document.activeElement;
+  bd.classList.add('open');
+  // Move focus into the dialog so Tab can't escape behind the modal.
+  const m = $('modal');
+  if (m && m.focus) m.focus();
+}
+function closeModal() {
+  $('modal-backdrop').classList.remove('open');
+  if (modalReturnFocus && modalReturnFocus.focus) {
+    try { modalReturnFocus.focus(); } catch {}
+  }
+  modalReturnFocus = null;
+}
+
+// Keep Tab / Shift-Tab cycling inside the open modal.
+document.addEventListener('keydown', ev => {
+  if (ev.key !== 'Tab') return;
+  if (!$('modal-backdrop').classList.contains('open')) return;
+  const sel = 'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
+  const focusables = Array.from($('modal').querySelectorAll(sel))
+    .filter(el => !el.disabled && el.offsetParent !== null);
+  if (!focusables.length) return;
+  const first = focusables[0], last = focusables[focusables.length - 1];
+  if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last.focus(); }
+  else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first.focus(); }
+});
 
 const SUN = '<circle cx="12" cy="12" r="4.2"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>';
 const MOON = '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>';
@@ -1499,10 +1741,28 @@ function applyTheme(dark) {
   const meta = document.querySelector('meta[name="theme-color"]');
   if (meta) meta.setAttribute('content', dark ? '#0E0F13' : '#6366F1');
 }
-function toggleTheme() {
-  const dark = !document.body.classList.contains('dark');
-  localStorage.setItem(LS.theme, dark ? 'dark' : 'light');
-  applyTheme(dark);
+
+// Three states: Auto (follow the device's prefers-color-scheme), Light, Dark.
+function themePref() {
+  const saved = localStorage.getItem(LS.theme);
+  return saved === 'light' || saved === 'dark' ? saved : 'auto';
+}
+function themeLabel() {
+  const p = themePref();
+  return p === 'dark' ? 'Dark' : p === 'light' ? 'Light' : 'Auto';
+}
+function isDarkNow() {
+  const p = themePref();
+  return p === 'dark' ? true
+    : p === 'light' ? false
+    : !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+}
+function applyThemeNow() { applyTheme(isDarkNow()); }
+function cycleTheme() {
+  const order = ['auto', 'light', 'dark'];
+  const next = order[(order.indexOf(themePref()) + 1) % order.length];
+  localStorage.setItem(LS.theme, next);
+  applyThemeNow();
   // Mood colours differ per theme and are baked into already-rendered markup
   // (inline styles, the canvas, the heatmap), so the view has to be redrawn —
   // a CSS variable swap can't reach them. Commit first: renderWrite() rebuilds
@@ -1512,17 +1772,20 @@ function toggleTheme() {
   if (typeof ready !== 'undefined' && ready) render();
 }
 function initTheme() {
-  const saved = localStorage.getItem(LS.theme);
-  const dark = saved ? saved === 'dark'
-    : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
-  applyTheme(!!dark);
+  applyThemeNow();
+  if (window.matchMedia) {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const onChange = () => { if (themePref() === 'auto') applyThemeNow(); };
+    if (mq.addEventListener) mq.addEventListener('change', onChange);
+    else if (mq.addListener) mq.addListener(onChange);
+  }
 }
 
 /* ─── Wiring ──────────────────────────────────────────────────── */
 
 function wireChrome() {
   document.querySelectorAll('.tab, .bn-item').forEach(b => { b.onclick = () => go(b.dataset.view); });
-  $('theme-toggle').onclick = toggleTheme;
+  $('theme-toggle').onclick = cycleTheme;
   $('avatar-btn').onclick = () => go('settings');
   $('modal-close').onclick = closeModal;
   $('modal-backdrop').addEventListener('click', ev => { if (ev.target.id === 'modal-backdrop') closeModal(); });
@@ -1541,7 +1804,30 @@ function wireChrome() {
     }
   });
 
-  window.addEventListener('beforeunload', () => { if (state.view === 'write') commitDraft(); });
+  // On unload, only the synchronous local write is trustworthy — an async
+  // Firestore push here is a race the browser is free to cancel. The next
+  // boot's pullAll() pushback carries the change up instead.
+  window.addEventListener('beforeunload', () => { if (state.view === 'write') commitDraft({ localOnly: true }); });
+
+  // Two tabs on the same browser otherwise overwrite each other's edits to
+  // the same day silently. The storage event fires in every OTHER tab when
+  // one of them writes the entries store.
+  let tabConflictAskedAt = 0;
+  window.addEventListener('storage', ev => {
+    if (!ev.key || ev.key.indexOf('jr3_entries') !== 0) return;
+    if (state.view !== 'write') return;
+    if (Date.now() - tabConflictAskedAt < 30000) return;
+    let incoming = {};
+    try { incoming = JSON.parse(ev.newValue || '{}'); } catch { return; }
+    const theirs = incoming[state.date] || null;
+    const mine = DB.entries[state.date] || null;
+    if (JSON.stringify(theirs) === JSON.stringify(mine)) return;
+    tabConflictAskedAt = Date.now();
+    if (confirm('This entry changed in another tab. Replace what this tab has with that version?')) {
+      loadLocal();
+      render();
+    }
+  });
 
   // Canvas pixels don't reflow on their own — redraw when the box changes.
   let resizeTimer = null;
@@ -1572,7 +1858,8 @@ let ready = false;
 
 function init() {
   initTheme();
-  loadLocal();
+  loadPrefs();
+  retireLegacyKeys();
 
   const btn = $('google-signin-btn');
   const err = $('signin-error');
@@ -1595,6 +1882,7 @@ function init() {
   fbAuth.onAuthStateChanged(async user => {
     fbUser = user;
     if (!user) {
+      DB.entries = {};
       $('boot').classList.add('hide');
       $('app').classList.remove('show');
       $('auth-gate').classList.add('show');
@@ -1604,6 +1892,11 @@ function init() {
     }
     $('auth-gate').classList.remove('show');
     window.__journalReady = true;   // gate cleared; app is running
+
+    // Load THIS account's entries (localStorage is namespaced per uid), so an
+    // interrupted sign-out can never leak one account's days into the next.
+    DB.entries = {};
+    loadEntries();
 
     if (user.photoURL) $('avatar-btn').innerHTML = '<img src="' + user.photoURL + '" referrerpolicy="no-referrer" alt="">';
     else { const a = $('avatar-inner'); if (a) a.textContent = (user.email || 'U')[0].toUpperCase(); }
@@ -1617,6 +1910,7 @@ function init() {
     if (hasPinLock()) await unlockFlow();
 
     await pullAll();
+    purgeTrash();
 
     $('app').classList.add('show');
     render();
