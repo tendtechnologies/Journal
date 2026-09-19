@@ -16,7 +16,7 @@ const {
   normalize, blankEntry, isEmpty,
   TRASH_DAYS, applyTombstone, restoreFromTombstone, isPurged,
   mergeRemoteEntry, needsPush,
-  computeStreaks, promptFor,
+  computeStreaks, promptFor, onboardingStep, reminderDue,
 } = core;
 
 /* ── Dates ─────────────────────────────────────────────────────── */
@@ -190,4 +190,35 @@ test('promptFor is deterministic and within range', () => {
   assert.equal(a, promptFor('2026-09-17'));
   assert.ok(core.PROMPTS.includes(a));
   assert.notEqual(promptFor('2026-09-17'), promptFor('2026-09-18'));
+});
+
+/* ── Onboarding ────────────────────────────────────────────────── */
+
+test('onboardingStep: welcome → first-entry → done', () => {
+  // Already onboarded: never anything to show, signed in or not.
+  assert.equal(onboardingStep({ onboarded: true, signedIn: true, hasEntries: true }), 'done');
+  assert.equal(onboardingStep({ onboarded: true, signedIn: false, hasEntries: false }), 'done');
+  // Fresh install, signed out: lead with what the app is.
+  assert.equal(onboardingStep({ onboarded: false, signedIn: false, hasEntries: false }), 'welcome');
+  // Signed in on a brand-new account: land on Write with a prompt ready.
+  assert.equal(onboardingStep({ onboarded: false, signedIn: true, hasEntries: false }), 'first-entry');
+  // Signed in but entries already exist: the app speaks for itself.
+  assert.equal(onboardingStep({ onboarded: false, signedIn: true, hasEntries: true }), 'done');
+});
+
+/* ── Daily reminder ────────────────────────────────────────────── */
+
+test('reminderDue: disabled, written, already fired, before/after time', () => {
+  const today = '2026-09-18';
+  const at = (h, m) => new Date(2026, 8, 18, h, m);
+  const cfg = { enabled: true, time: '21:00' };
+
+  assert.equal(reminderDue({ enabled: false, time: '21:00' }, false, at(22, 0), null, today), false);
+  assert.equal(reminderDue(cfg, true, at(22, 0), null, today), false);            // already wrote
+  assert.equal(reminderDue(cfg, false, at(22, 0), today, today), false);          // already fired today
+  assert.equal(reminderDue(cfg, false, at(20, 59), null, today), false);          // before 21:00
+  assert.equal(reminderDue(cfg, false, at(21, 0), null, today), true);            // exactly 21:00
+  assert.equal(reminderDue(cfg, false, at(23, 30), null, today), true);           // well after
+  assert.equal(reminderDue(cfg, false, at(23, 30), '2026-09-17', today), true);   // fired yesterday only
+  assert.equal(reminderDue({ enabled: true, time: 'junk' }, false, at(23, 30), null, today), false);
 });

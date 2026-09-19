@@ -275,6 +275,34 @@ function promptFor(k) {
   return PROMPTS[h % PROMPTS.length];
 }
 
+/* ─── First-run onboarding ────────────────────────────────────────
+   Which onboarding experience a boot should show. 'welcome': never
+   seen the app on this device — lead with what it is, then hand off
+   to sign-in. 'first-entry': signed in on a brand-new account — land
+   on Write with a prompt at the ready. 'done': nothing to show.    */
+
+function onboardingStep({ onboarded, signedIn, hasEntries }) {
+  if (onboarded) return 'done';
+  if (!signedIn) return 'welcome';
+  return hasEntries ? 'done' : 'first-entry';
+}
+
+/* ─── Daily reminder ──────────────────────────────────────────────
+   Serverless due-check shared by the page (which fires when the app
+   is opened or becomes visible) and the best-effort Periodic Background
+   Sync path in the service worker. Exact clock-time delivery needs a
+   push server (FCM); without one, "due" means "the next check at/after
+   the chosen time". lastFiredKey/today are date keys (yyyy-mm-dd). ── */
+
+function reminderDue({ enabled, time }, hasEntryToday, now, lastFiredKey, today) {
+  if (!enabled || typeof time !== 'string' || !/^\d{1,2}:\d{2}$/.test(time)) return false;
+  if (hasEntryToday) return false;
+  if (lastFiredKey === today) return false;
+  const parts = time.split(':');
+  const target = Number(parts[0]) * 60 + Number(parts[1]);
+  return now.getHours() * 60 + now.getMinutes() >= target;
+}
+
 /* ─── Node export (the browser ignores this) ──────────────────── */
 
 if (typeof module !== 'undefined' && module.exports) {
@@ -286,5 +314,6 @@ if (typeof module !== 'undefined' && module.exports) {
     mergeRemoteEntry, needsPush,
     computeStreaks,
     MOODS, mood, moodLabel, FACE, PROMPTS, promptFor,
+    onboardingStep, reminderDue,
   };
 }

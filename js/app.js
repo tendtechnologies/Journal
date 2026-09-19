@@ -208,7 +208,7 @@ function moodColor(v) {
 /* ─── Storage ─────────────────────────────────────────────────── */
 
 const LS = { theme: 'jr3_theme', prefs: 'jr3_prefs', pin: 'jr3_pin' };
-const DB = { entries: {}, prefs: { hidePrompt: false } };
+const DB = { entries: {}, prefs: { hidePrompt: false, reminder: { enabled: false, time: '21:00' } } };
 
 // Entry storage is namespaced per account (jr3_entries_<uid>). Without
 // this, a sign-out whose reload got interrupted would leave the previous
@@ -252,6 +252,119 @@ function saveLocal() {
   }
 }
 function savePrefs() { localStorage.setItem(LS.prefs, JSON.stringify(DB.prefs)); }
+
+/* ─── First-run onboarding (plan item 23) ───
+   The flag is device-level (like prefs), not per-account: onboarding
+   is about the install, not the user. */
+const onboarded = () => localStorage.getItem('jr3_onboarded') === '1';
+function completeOnboarding() { localStorage.setItem('jr3_onboarded', '1'); }
+function firstRunStep() {
+  return onboardingStep({ onboarded: onboarded(), signedIn: !!fbUser, hasEntries: allEntries().length > 0 });
+}
+
+/* ─── Daily reminder (plan item 24) ─── */
+const LS_REMINDER_FIRED = 'jr3_reminder_fired';
+
+// Prefs saved before reminders existed have no reminder object (and
+// loadPrefs merges shallowly), so always normalize before reading.
+function prefsReminder() {
+  if (!DB.prefs.reminder || typeof DB.prefs.reminder !== 'object') {
+    DB.prefs.reminder = { enabled: false, time: '21:00' };
+  }
+  return DB.prefs.reminder;
+}
+
+function reminderDesc() {
+  const r = prefsReminder();
+  if (!('Notification' in window)) return 'Not supported in this browser';
+  if (!r.enabled) return 'Nudge me once a day if I haven\u2019t written';
+  if (Notification.permission === 'denied') return 'Blocked in this browser — allow notifications in site settings, then turn this on again';
+  return 'Reminds you at ' + (r.time || '21:00') + ' if you haven\u2019t written that day';
+}
+
+async function swRegistration() {
+  if (!('serviceWorker' in navigator)) return null;
+  try { return await navigator.serviceWorker.ready; } catch { return null; }
+}
+
+async function showReminderNotification(body, tag) {
+  const reg = await swRegistration();
+  if (!reg || !reg.showNotification) {
+    toast('Install the app on this device to receive notifications');
+    return false;
+  }
+  await reg.showNotification('Journal', {
+    body,
+    icon: 'assets/icon-192.png',
+    badge: 'assets/icon-192.png',
+    tag,
+  });
+  return true;
+}
+
+// The service worker can't read the page's localStorage, so the state it
+// needs for the background path travels through the Cache API, which both
+// sides can open.
+async function shareReminderState() {
+  const r = prefsReminder();
+  try {
+    const c = await caches.open('journal-sw-meta');
+    await c.put('/reminder-state', new Response(JSON.stringify({
+      enabled: !!r.enabled,
+      time: r.time || '21:00',
+      fired: localStorage.getItem(LS_REMINDER_FIRED),
+      writtenToday: !!liveEntry(todayKey()),
+    })));
+  } catch { /* best-effort */ }
+}
+
+// Periodic Background Sync is Android-Chrome-only and fires on the browser's
+// own schedule — a bonus wake at/after the chosen time, not an exact alarm.
+async function syncReminderBackground() {
+  const reg = await swRegistration();
+  if (!reg) return;
+  await shareReminderState();
+  const r = prefsReminder();
+  if (r.enabled && reg.periodicSync) {
+    try {
+      const status = await navigator.permissions.query({ name: 'periodic-background-sync' }).catch(() => null);
+      if (!status || status.state === 'granted') {
+        await reg.periodicSync.register('daily-reminder', { minInterval: 12 * 60 * 60 * 1000 });
+      }
+    } catch { /* best-effort */ }
+  } else if (!r.enabled && reg.periodicSync) {
+    try { await reg.periodicSync.unregister('daily-reminder'); } catch { /* best-effort */ }
+  }
+}
+
+// Runs on boot, on becoming visible, and right after enabling: the
+// serverless path fires the next time the app is around at/after the
+// chosen hour. Fires at most once per day (LS_REMINDER_FIRED).
+async function reminderCheck() {
+  const r = prefsReminder();
+  if (!r.enabled || !('Notification' in window) || Notification.permission !== 'granted') return;
+  await shareReminderState();   // keep the SW's copy fresh on every check
+  const now = new Date();
+  const today = todayKey();
+  if (!reminderDue({ enabled: true, time: r.time }, !!liveEntry(today), now, localStorage.getItem(LS_REMINDER_FIRED), today)) return;
+  // Mark fired BEFORE showing: if showNotification throws (e.g. the SW is
+  // shutting down), a retry loop would be worse than a missed nudge.
+  localStorage.setItem(LS_REMINDER_FIRED, today);
+  await shareReminderState();
+  await showReminderNotification('You haven\u2019t written today — one line is enough.', 'daily-reminder');
+}
+
+async function sendTestReminder() {
+  if (!('Notification' in window)) { toast('This browser does not support notifications'); return; }
+  if (Notification.permission !== 'granted') {
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') {
+      toast('Notifications are blocked — allow them in this browser\u2019s site settings');
+      return;
+    }
+  }
+  await showReminderNotification('This is how your daily reminder will look.', 'reminder-test');
+}
 
 // Retire storage from earlier builds so nothing stale leaks through.
 // ('jr3_entries' is deliberately NOT here — loadEntries() migrates it into
@@ -550,6 +663,8 @@ function render() {
   if (state.view === 'calendar') renderCalendar();
   if (state.view === 'insights') renderInsights();
   if (state.view === 'settings') renderSettings();
+
+  reminderCheck();   // fires only when due; no-op the rest of the time
 }
 
 function go(view) {
@@ -589,6 +704,9 @@ function renderWrite() {
   const isToday  = key === todayKey();
   const isFuture = daysBetween(todayKey(), key) < 0;
   const showPrompt = !DB.prefs.hidePrompt && !e.plain && !e.title;
+  // First entry ever on a brand-new account: the prompt doubles as the
+  // writer's placeholder and a small hint points it out (below).
+  const firstEntry = isToday && firstRunStep() === 'first-entry';
 
   content().innerHTML = `
     <div class="day-nav">
@@ -609,6 +727,14 @@ function renderWrite() {
     </button>` : ''}
 
     ${isFuture ? `<div class="notice">You're looking at a future date. Entries are meant for days that have happened.</div>` : `
+
+    ${firstEntry ? `<div class="first-run-hint" id="first-run-hint">
+      <svg viewBox="0 0 24 24" class="ic"><path d="M12 17.75l-6.17 3.24 1.18-6.87-5-4.86 6.9-1L12 2l3.09 6.26 6.9 1-5 4.86 1.18 6.87z"/></svg>
+      <span>This is your first entry — start anywhere. The prompt above is one way in.</span>
+      <button class="icon-btn xs" id="first-run-dismiss" aria-label="Dismiss hint">
+        <svg viewBox="0 0 24 24" class="ic"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>` : ''}
 
     <div class="card writer">
       ${showPrompt ? `<div class="prompt-strip" id="prompt-strip">
@@ -672,6 +798,7 @@ function renderWrite() {
   renderTags();
   renderPhotos();
   updateWords();
+  if (firstEntry) $('w-body').dataset.placeholder = promptFor(key);
   $('tag-suggest').innerHTML = allTags().map(t => `<option value="${esc(t.tag)}">`).join('');
 
   wireDayNav();
@@ -819,6 +946,9 @@ function commitDraft(opts) {
   const e = state.draft;
   if (!e || !isKey(e.date)) return null;
   readDraft();
+  // Capture before writing: the save below puts this entry into DB.entries,
+  // which would flip firstRunStep() to 'done' before we get to celebrate it.
+  const firstEntry = firstRunStep() === 'first-entry';
   const stored = DB.entries[e.date];
   const had = !!(stored && !stored.deleted);
 
@@ -849,6 +979,11 @@ function commitDraft(opts) {
   delete finished.deletedAt;
   DB.entries[e.date] = finished;
   saveLocal();
+  if (firstEntry) {
+    // The first line is written — onboarding is over.
+    completeOnboarding();
+    const h = $('first-run-hint'); if (h) h.remove();
+  }
   if (opts && opts.localOnly) return null;
   return pushDay(finished);
 }
@@ -952,6 +1087,12 @@ function wireWriter() {
   if (ph) ph.onclick = () => {
     DB.prefs.hidePrompt = true; savePrefs();
     const s = $('prompt-strip'); if (s) s.remove();
+  };
+
+  const frd = $('first-run-dismiss');
+  if (frd) frd.onclick = () => {
+    completeOnboarding();
+    const h = $('first-run-hint'); if (h) h.remove();
   };
 
   const ti = $('tag-input');
@@ -1569,6 +1710,14 @@ function renderSettings() {
         <button class="btn-secondary" id="toggle-prompt">${DB.prefs.hidePrompt ? 'Off' : 'On'}</button>
       </div>
       <div class="set-row">
+        <div><div class="lbl">Daily reminder</div><p id="reminder-desc">${reminderDesc()}</p></div>
+        <div class="reminder-ctl">
+          <input type="time" id="reminder-time" value="${esc(prefsReminder().time || '21:00')}" aria-label="Reminder time">
+          <button class="btn-secondary" id="toggle-reminder">${prefsReminder().enabled ? 'On' : 'Off'}</button>
+          <button class="btn-secondary" id="reminder-test">Test</button>
+        </div>
+      </div>
+      <div class="set-row">
         <div><div class="lbl">Appearance</div><p>Auto follows this device's setting</p></div>
         <button class="btn-secondary" id="toggle-theme-2">${themeLabel()}</button>
       </div>
@@ -1624,6 +1773,32 @@ function renderSettings() {
   $('signout').onclick = () => fbAuth.signOut().then(() => location.reload());
   $('toggle-prompt').onclick = () => { DB.prefs.hidePrompt = !DB.prefs.hidePrompt; savePrefs(); renderSettings(); };
   $('toggle-theme-2').onclick = () => { cycleTheme(); renderSettings(); };
+
+  const rtime = $('reminder-time');
+  if (rtime) rtime.onchange = () => {
+    prefsReminder().time = rtime.value || '21:00';
+    savePrefs();
+    const d = $('reminder-desc'); if (d) d.textContent = reminderDesc();
+    syncReminderBackground();
+  };
+  $('toggle-reminder').onclick = async () => {
+    const r = prefsReminder();
+    if (r.enabled) {
+      r.enabled = false; savePrefs(); renderSettings(); syncReminderBackground();
+      return;
+    }
+    if (!('Notification' in window)) { toast('This browser does not support notifications'); return; }
+    const perm = Notification.permission === 'granted' ? 'granted' : await Notification.requestPermission();
+    if (perm !== 'granted') {
+      toast('Notifications are blocked in this browser', { label: 'How to allow', onClick: () =>
+        toast('Browser site settings → Notifications → Allow, then turn the reminder on') });
+      return;
+    }
+    r.enabled = true; savePrefs(); renderSettings();
+    syncReminderBackground();
+    reminderCheck();
+  };
+  $('reminder-test').onclick = sendTestReminder;
 
   $('pin-toggle').onclick = async () => {
     const ok = hasPinLock() ? await disablePinFlow() : await createPinFlow();
@@ -1847,6 +2022,7 @@ function wireChrome() {
       if (hasPinLock() && hiddenAt && (Date.now() - hiddenAt) > PIN_RELOCK_MS && $('app').classList.contains('show')) {
         lockAppNow();
       }
+      reminderCheck();   // e.g. opened the phone after the reminder hour
       hiddenAt = null;
     }
   });
@@ -1863,6 +2039,14 @@ function init() {
 
   const btn = $('google-signin-btn');
   const err = $('signin-error');
+
+  // Onboarding screen 1 → screen 2 (sign in). The flag is only set once
+  // onboarding actually completes (first entry written, hint dismissed,
+  // or an account with entries signs in) — never here.
+  $('welcome-continue').onclick = () => {
+    $('welcome-gate').classList.remove('show');
+    $('auth-gate').classList.add('show');
+  };
 
   btn.onclick = () => {
     btn.disabled = true;
@@ -1885,12 +2069,21 @@ function init() {
       DB.entries = {};
       $('boot').classList.add('hide');
       $('app').classList.remove('show');
-      $('auth-gate').classList.add('show');
+      // First run leads with the welcome screen; every later sign-out
+      // (or fresh device for a returning account) goes straight to sign-in.
+      if (firstRunStep() === 'welcome') {
+        $('auth-gate').classList.remove('show');
+        $('welcome-gate').classList.add('show');
+      } else {
+        $('welcome-gate').classList.remove('show');
+        $('auth-gate').classList.add('show');
+      }
       btn.disabled = false;
       window.__journalReady = true;   // signed out is a valid state, not a failure
       return;
     }
     $('auth-gate').classList.remove('show');
+    $('welcome-gate').classList.remove('show');
     window.__journalReady = true;   // gate cleared; app is running
 
     // Load THIS account's entries (localStorage is namespaced per uid), so an
@@ -1911,6 +2104,10 @@ function init() {
 
     await pullAll();
     purgeTrash();
+
+    // An account that already has entries never needs the first-run
+    // treatment — mark onboarding seen silently.
+    if (!onboarded() && allEntries().length > 0) completeOnboarding();
 
     $('app').classList.add('show');
     render();

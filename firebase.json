@@ -1,0 +1,32 @@
+{
+  "hosting": {
+    "site": "journal",
+    "public": ".",
+    "ignore": [
+      "firebase.json",
+      ".firebaserc",
+      "**/.*",
+      "**/node_modules/**",
+      "android/**",
+      "tests/**",
+      "test-results/**",
+      "scripts/**",
+      "package.json",
+      "package-lock.json",
+      "playwright.config.js",
+      "IMPROVEMENT_PLAN.md",
+      "SCHEMA.md",
+      "firestore.rules"
+    ],
+    "headers": [
+      {
+        "source": "/sw.js",
+        "headers": [{ "key": "Cache-Control", "value": "no-cache" }]
+      },
+      {
+        "source": "/index.html",
+        "headers": [{ "key": "Cache-Control", "value": "no-cache" }]
+      }
+    ]
+  }
+}

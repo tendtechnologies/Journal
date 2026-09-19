@@ -12,9 +12,11 @@ test('the app shell loads without crashing before Firebase ever responds', async
   await page.goto('/index.html');
   await expect(page).toHaveTitle('Journal');
 
-  // The signed-out auth gate is the first real thing rendered. Reaching it
-  // means index.html, css/app.css, js/app.js and js/boot.js all parsed and
-  // ran without a top-level exception.
+  // First run leads with the welcome screen, then hands off to the signed-out
+  // auth gate. Reaching the welcome means index.html, css/app.css, js/app.js
+  // and js/boot.js all parsed and ran without a top-level exception.
+  await expect(page.locator('#welcome-gate')).toBeVisible();
+  await page.locator('#welcome-continue').click();
   await expect(page.locator('#auth-gate')).toBeVisible();
 
   // Firebase itself has no project to talk to in this test environment, so
@@ -22,6 +24,13 @@ test('the app shell loads without crashing before Firebase ever responds', async
   // those, only errors from our own code.
   const realErrors = pageErrors.filter(e => !/firebase/i.test(String(e)));
   expect(realErrors.map(String)).toEqual([]);
+});
+
+test('returning users skip the welcome screen', async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem('jr3_onboarded', '1'));
+  await page.goto('/index.html');
+  await expect(page.locator('#welcome-gate')).toBeHidden();
+  await expect(page.locator('#auth-gate')).toBeVisible();
 });
 
 test('manifest and service worker are reachable', async ({ request }) => {

@@ -29,9 +29,19 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Lora:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="css/app.css?v=12" />
+  <link rel="stylesheet" href="css/app.css?v=13" />
 </head>
 <body>
+
+  <!-- First-run welcome (onboarding screen 1; shown once per device) -->
+  <div id="welcome-gate">
+    <div class="gate-card">
+      <img src="assets/icon-192.png" width="56" height="56" class="gate-icon" alt="" />
+      <h1 class="gate-title">A quiet place to write</h1>
+      <p class="gate-sub">One entry a day — mood, photos, and a streak to keep you coming back. Private to your account, synced across your devices.</p>
+      <button class="btn-primary" id="welcome-continue">Get started</button>
+    </div>
+  </div>
 
   <!-- Auth gate -->
   <div id="auth-gate">
@@ -158,9 +168,9 @@
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-storage-compat.js"></script>
-  <script src="js/core.js?v=12"></script>
-  <script src="js/app.js?v=12"></script>
+  <script src="js/core.js?v=13"></script>
+  <script src="js/app.js?v=13"></script>
 
-  <script src="js/boot.js?v=12"></script>
+  <script src="js/boot.js?v=13"></script>
 </body>
 </html>

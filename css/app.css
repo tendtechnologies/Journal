@@ -143,6 +143,30 @@ button { background: none; border: none; cursor: pointer; }
 #google-signin-btn:disabled { opacity: .55; }
 .gate-error { color: var(--red); font-size: .78rem; min-height: 1em; }
 
+/* ─── First-run welcome / onboarding hint ─── */
+#welcome-gate {
+  position: fixed; inset: 0; z-index: 9999; background: var(--bg);
+  display: none; align-items: center; justify-content: center; padding: 24px;
+}
+#welcome-gate.show { display: flex; }
+.first-run-hint {
+  display: flex; align-items: center; gap: 10px;
+  margin: 0 0 12px; padding: 10px 14px;
+  border-radius: var(--r-md);
+  background: var(--accent-soft); border: 1px solid var(--accent-ring);
+  color: var(--text-2); font-size: .84rem; line-height: 1.45;
+}
+.first-run-hint .ic { font-size: 15px; flex-shrink: 0; color: var(--accent); }
+.first-run-hint > span { flex: 1; }
+
+/* ─── Daily reminder controls (settings) ─── */
+.reminder-ctl { display: flex; align-items: center; gap: 8px; }
+.reminder-ctl input[type="time"] {
+  padding: 7px 9px; border-radius: var(--r-sm);
+  border: 1px solid var(--border); background: var(--surface);
+  color: var(--text-1); font: inherit; font-size: .85rem;
+}
+
 /* ─── PIN gate ─── */
 #pin-gate {
   position: fixed; inset: 0; z-index: 9997; background: var(--bg);
